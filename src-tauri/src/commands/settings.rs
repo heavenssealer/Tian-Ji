@@ -39,6 +39,19 @@ pub async fn settings_has_api_key(_state: State<'_, AppState>) -> AppResult<bool
 }
 
 #[tauri::command]
+pub async fn settings_set_sudo_password(state: State<'_, AppState>, password: String) -> AppResult<()> {
+    secrets::set_api_key("sudo", &password)?;
+    rebuild_current(&state)
+}
+
+#[tauri::command]
+pub async fn settings_has_sudo_password(_state: State<'_, AppState>) -> AppResult<bool> {
+    Ok(secrets::get_api_key("sudo")?
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false))
+}
+
+#[tauri::command]
 pub async fn settings_list_models(_state: State<'_, AppState>) -> AppResult<Vec<String>> {
     Ok(MODELS.iter().map(|s| s.to_string()).collect())
 }

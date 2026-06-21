@@ -42,6 +42,8 @@ export const ipc = {
 
   settingsSetApiKey: (key: string) => invoke<void>("settings_set_api_key", { key }),
   settingsHasApiKey: () => invoke<boolean>("settings_has_api_key"),
+  settingsSetSudoPassword: (password: string) => invoke<void>("settings_set_sudo_password", { password }),
+  settingsHasSudoPassword: () => invoke<boolean>("settings_has_sudo_password"),
   settingsListModels: () => invoke<string[]>("settings_list_models"),
   settingsGetModel: () => invoke<string>("settings_get_model"),
   settingsSetModel: (model: string) => invoke<void>("settings_set_model", { model }),

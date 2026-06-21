@@ -103,7 +103,7 @@ impl Orchestrator {
             provider,
             gate: Arc::new(ApprovalGate::default()),
             mcp: McpHost::new(),
-            runner: Arc::new(ProcessRunner),
+            runner: Arc::new(ProcessRunner::new()),
             actor: AgentId("agent".to_string()),
             autonomous: Arc::new(AtomicBool::new(false)),
             free_mode: Arc::new(AtomicBool::new(false)),
@@ -786,7 +786,12 @@ fn system_prompt(phase: Phase, scope: &ScopeRules, notes: &[tianji_types::Event]
          use `ipconfig` not `ifconfig`, `netstat -ano`, `dir` not `ls`, etc. \
          Never emit Unix-only flags."
     } else {
-        "The operator's machine runs Linux/macOS. Use POSIX syntax."
+        "The operator's machine runs Linux/macOS. Use POSIX syntax. \
+         For commands that need root (editing /etc/hosts, writing to /etc/, ip route, iptables, \
+         raw packet tools, etc.), prefix with `sudo` — use it as the tool name and pass the real \
+         command as arguments (e.g. tool=sudo argv=[\"tee\",\"-a\",\"/etc/hosts\"]). \
+         Network scanning tools such as nmap and masscan are auto-elevated by the runner when \
+         NOPASSWD sudo is configured."
     };
 
     format!(

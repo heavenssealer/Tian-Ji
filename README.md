@@ -152,6 +152,37 @@ npm run tauri build
 
 ---
 
+## Privileged tools (sudo)
+
+Some pentesting tools need root access (nmap SYN/raw-socket scans, tcpdump, masscan, arp-scan,
+editing `/etc/hosts`, etc.). The agent handles this two ways:
+
+- **Auto-elevation**: `nmap`, `masscan`, `rustscan`, `tcpdump`, `tshark`, `arp-scan`, and
+  `netdiscover` are automatically wrapped with `sudo -n` on Linux/macOS. `sudo -n` is
+  non-interactive — it fails immediately with a clear error if passwordless sudo is not
+  configured, rather than hanging.
+- **Explicit sudo**: for everything else (file writes, `ip`, `iptables`, etc.) the LLM uses
+  `sudo` as the tool name directly.
+
+**One-time sudoers setup** — grant NOPASSWD for the tools you use:
+
+```bash
+sudo visudo -f /etc/sudoers.d/tianji
+```
+
+Paste (replace `youruser` with your username):
+
+```
+youruser ALL=(ALL) NOPASSWD: /usr/bin/nmap, /usr/bin/masscan, /usr/bin/rustscan, \
+    /usr/bin/tcpdump, /usr/bin/tshark, /usr/sbin/arp-scan, /usr/sbin/netdiscover, \
+    /usr/bin/tee, /bin/tee, /usr/bin/ip, /sbin/iptables
+```
+
+> **Kali Linux**: the default user runs as root — no sudoers config needed.
+
+> **macOS**: use `sudo visudo` and add the same block. Tool paths may differ
+> (`/opt/homebrew/bin/nmap` etc.) — check with `which nmap`.
+
 ## API key
 
 The agent requires an **Anthropic API key**. Enter it once in the Settings panel (⚙ icon) —

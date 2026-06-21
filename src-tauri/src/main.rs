@@ -58,6 +58,8 @@ fn main() {
             commands::query::findings_query,
             commands::settings::settings_set_api_key,
             commands::settings::settings_has_api_key,
+            commands::settings::settings_set_sudo_password,
+            commands::settings::settings_has_sudo_password,
             commands::settings::settings_list_models,
             commands::settings::settings_get_model,
             commands::settings::settings_set_model,

@@ -109,8 +109,11 @@ impl CurrentWorkspace {
         free_mode: Arc<AtomicBool>,
     ) -> Self {
         let key = crate::secrets::get_api_key("anthropic").ok().flatten().unwrap_or_default();
+        let sudo_pw = crate::secrets::get_api_key("sudo").ok().flatten();
         let provider = ClaudeProvider::new(key).with_model(model);
+        let runner = tianji_agent::ProcessRunner::with_sudo_password(sudo_pw);
         let orchestrator = Orchestrator::new(Arc::new(provider))
+            .with_runner(Arc::new(runner))
             .with_flags(autonomous, free_mode);
         Self { meta, store, orchestrator }
     }

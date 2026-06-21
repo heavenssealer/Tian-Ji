@@ -26,14 +26,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: 22
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
 
       - name: Linux system dependencies
         if: matrix.name == 'linux'
@@ -59,25 +56,26 @@ jobs:
         if: matrix.name == 'macos'
         run: npm run tauri build -- --bundles dmg
 
+      # Cargo workspace target dir is at the repo root, not src-tauri/target.
       - name: Upload (Linux)
         if: matrix.name == 'linux'
         uses: actions/upload-artifact@v4
         with:
           name: linux
           path: |
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
 
       - name: Upload (Windows)
         if: matrix.name == 'windows'
         uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          path: target/release/bundle/nsis/*.exe
 
       - name: Upload (macOS)
         if: matrix.name == 'macos'
         uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          path: target/release/bundle/dmg/*.dmg
