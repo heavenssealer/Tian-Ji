@@ -4,7 +4,7 @@
 //! (DESIGN.md §9.6).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use tianji_agent::Orchestrator;
