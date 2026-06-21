@@ -119,6 +119,14 @@ impl Orchestrator {
         self
     }
 
+    /// Replace the internal autonomous/free_mode atoms with externally-owned ones so the caller
+    /// can set them without holding a reference to the orchestrator.
+    pub fn with_flags(mut self, autonomous: Arc<AtomicBool>, free_mode: Arc<AtomicBool>) -> Self {
+        self.autonomous = autonomous;
+        self.free_mode = free_mode;
+        self
+    }
+
     /// Shared handle to the approval gate, so `policy_resolve` can wake a parked turn.
     pub fn gate(&self) -> Arc<ApprovalGate> {
         self.gate.clone()

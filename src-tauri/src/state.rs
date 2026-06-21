@@ -4,6 +4,7 @@
 //! (DESIGN.md §9.6).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tianji_agent::Orchestrator;
@@ -56,6 +57,10 @@ pub struct AppState {
     /// The open workspace, behind an `Arc` so a command can clone it out and run a long async
     /// turn without holding the lock (or a `!Send` guard) across `.await`.
     pub current: Mutex<Option<Arc<CurrentWorkspace>>>,
+    /// Global agent-mode flags. Stored here (not inside the Orchestrator) so they survive
+    /// workspace switches and can be set before any workspace is opened.
+    pub autonomous: Arc<AtomicBool>,
+    pub free_mode: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -65,6 +70,8 @@ impl AppState {
             workspaces_root,
             pty: PtyManager::new(),
             current: Mutex::new(None),
+            autonomous: Arc::new(AtomicBool::new(false)),
+            free_mode: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -93,10 +100,18 @@ pub struct CurrentWorkspace {
 impl CurrentWorkspace {
     /// Assemble the bundle, wiring the Claude provider with the keychain-stored API key and the
     /// selected model (absent key is allowed — the provider errors only when a turn runs).
-    pub fn build(meta: WorkspaceMeta, store: WorkspaceStore, model: &str) -> Self {
+    /// `autonomous` and `free_mode` are owned by `AppState` so they survive workspace switches.
+    pub fn build(
+        meta: WorkspaceMeta,
+        store: WorkspaceStore,
+        model: &str,
+        autonomous: Arc<AtomicBool>,
+        free_mode: Arc<AtomicBool>,
+    ) -> Self {
         let key = crate::secrets::get_api_key("anthropic").ok().flatten().unwrap_or_default();
         let provider = ClaudeProvider::new(key).with_model(model);
-        let orchestrator = Orchestrator::new(Arc::new(provider));
+        let orchestrator = Orchestrator::new(Arc::new(provider))
+            .with_flags(autonomous, free_mode);
         Self { meta, store, orchestrator }
     }
 }

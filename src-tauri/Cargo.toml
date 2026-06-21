@@ -34,7 +34,7 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Tokio runtime + Rust crypto (no OpenSSL dep); talks to GNOME Keyring / KDE Wallet over D-Bus.
-keyring = { version = "3", features = ["async-secret-service", "tokio", "crypto-rust"] }
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [features]
 # Tauri custom-protocol for production builds.

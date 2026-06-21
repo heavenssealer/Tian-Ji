@@ -2,6 +2,8 @@
 //! stream back over `agent://delta` and `agent://approval_request`. The command returns
 //! immediately so the UI stays responsive while the turn runs.
 
+use std::sync::atomic::Ordering;
+
 use tauri::{AppHandle, Emitter, State};
 
 use crate::events;
@@ -37,17 +39,13 @@ pub async fn agent_prompt(
 
 #[tauri::command]
 pub async fn agent_set_free_mode(state: State<'_, AppState>, enabled: bool) -> AppResult<()> {
-    if let Ok(cw) = state.current() {
-        cw.orchestrator.set_free_mode(enabled);
-    }
+    state.free_mode.store(enabled, Ordering::SeqCst);
     Ok(())
 }
 
 #[tauri::command]
 pub async fn agent_set_autonomous(state: State<'_, AppState>, enabled: bool) -> AppResult<()> {
-    if let Ok(cw) = state.current() {
-        cw.orchestrator.set_autonomous(enabled);
-    }
+    state.autonomous.store(enabled, Ordering::SeqCst);
     Ok(())
 }
 

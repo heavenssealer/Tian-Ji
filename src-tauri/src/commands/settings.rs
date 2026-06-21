@@ -18,7 +18,9 @@ fn rebuild_current(state: &AppState) -> AppResult<()> {
     if let Some(meta) = open {
         let store = WorkspaceStore::open(std::path::Path::new(&meta.root_path))?;
         let model = state.model();
-        *state.current.lock().unwrap() = Some(Arc::new(CurrentWorkspace::build(meta, store, &model)));
+        *state.current.lock().unwrap() = Some(Arc::new(CurrentWorkspace::build(
+            meta, store, &model, state.autonomous.clone(), state.free_mode.clone(),
+        )));
     }
     Ok(())
 }
