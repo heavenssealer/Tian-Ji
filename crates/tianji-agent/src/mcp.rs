@@ -36,13 +36,22 @@ fn run_command_spec() -> ToolSpec {
     ToolSpec {
         name: "run_command".to_string(),
         description:
-            "Run a system command in a terminal. Subject to scope + tiered approval policy."
+            "Run a single system command. Subject to scope + tiered approval policy.\n\
+             - `tool` is the bare executable name only (e.g. \"nmap\"), NEVER \"run_command\".\n\
+             - `argv` is the argument list, one element per token.\n\
+             - The command runs WITHOUT a shell, so pipes/redirects/globs do NOT work as separate \
+             argv tokens. To use `| > >> && ;` etc., set tool=\"bash\" and argv=[\"-c\", \"<the \
+             whole command line as one string>\"].\n\
+             - Quote any single argument that itself contains spaces or shell metacharacters \
+             (e.g. a POST body \"username=admin&password=admin\") as ONE argv element.\n\
+             - Read-only commands are cached per session: re-issuing an identical command returns \
+             the cached result. Do NOT repeat scans you have already run — reuse earlier output."
                 .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "tool": { "type": "string", "description": "executable, e.g. nmap" },
-                "argv": { "type": "array", "items": { "type": "string" } }
+                "tool": { "type": "string", "description": "bare executable, e.g. nmap, curl, bash" },
+                "argv": { "type": "array", "items": { "type": "string" }, "description": "arguments, one token per element" }
             },
             "required": ["tool", "argv"]
         }),

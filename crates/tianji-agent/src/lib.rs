@@ -21,8 +21,8 @@ use tianji_llm::LlmProvider;
 use tianji_policy::{classify, decide, resolve_targets, AllowRule};
 use tianji_store::WorkspaceStore;
 use tianji_types::{
-    AgentEvent, AgentId, Author, Content, Decision, Event, EventKind, Message, Phase, Role,
-    ScopeRules, ToolCall, WorkspaceId,
+    AgentEvent, AgentId, Author, Classification, Content, Decision, Event, EventKind, Message,
+    Phase, Role, ScopeRules, ToolCall, WorkspaceId,
 };
 
 mod approval;
@@ -93,6 +93,9 @@ pub struct Orchestrator {
     histories: std::sync::Mutex<HashMap<String, Vec<Message>>>,
     /// The currently-active session id.
     active_session: std::sync::Mutex<String>,
+    /// Dedup cache for read-only commands: key = session+tool+argv, value = prior output. Stops
+    /// the model from burning tokens re-running identical scans (DESIGN.md §efficiency).
+    command_cache: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl Orchestrator {
@@ -110,7 +113,28 @@ impl Orchestrator {
             cancelled: Arc::new(AtomicBool::new(false)),
             histories: std::sync::Mutex::new(histories),
             active_session: std::sync::Mutex::new("default".to_string()),
+            command_cache: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Run a tool through the runner, deduping identical read-only commands within a session.
+    /// Mutating/exploit commands always run fresh (their effects aren't idempotent).
+    fn run_cached(&self, tool: &str, argv: &[String]) -> String {
+        if !matches!(classify(tool, argv), Classification::ReadOnly) {
+            return self.runner.run(tool, argv);
+        }
+        let session = self.active_session.lock().unwrap().clone();
+        let key = format!("{session}\u{1}{tool}\u{1}{}", argv.join("\u{1}"));
+        if let Some(prev) = self.command_cache.lock().unwrap().get(&key).cloned() {
+            return format!(
+                "(NOTE: this exact read-only command already ran earlier in the session — reusing \
+                 the prior result instead of re-running, to save time and tokens. Change the \
+                 command if you genuinely need fresh data.)\n{prev}"
+            );
+        }
+        let out = self.runner.run(tool, argv);
+        self.command_cache.lock().unwrap().insert(key, out.clone());
+        out
     }
 
     /// Inject a custom command runner (used in tests to avoid spawning real processes).
@@ -160,6 +184,7 @@ impl Orchestrator {
         let mut h = self.histories.lock().unwrap();
         h.insert(session_id.to_string(), Vec::new());
         *self.active_session.lock().unwrap() = session_id.to_string();
+        self.command_cache.lock().unwrap().clear();
     }
 
     /// Switch to an existing session (or create an empty one if unknown).
@@ -451,7 +476,7 @@ impl Orchestrator {
                             json!({ "tool": tool, "argv": argv }),
                         ))?;
                         let _ = updates.send(AgentUpdate::ToolStarted { tool: tool.clone(), argv: argv.clone() });
-                        let output = self.runner.run(&tool, &argv);
+                        let output = self.run_cached(&tool, &argv);
                         store.append(Event::new(
                             ws, subagent_phase, EventKind::ToolOutput,
                             subagent_actor.clone(), Author::Agent,
@@ -469,7 +494,7 @@ impl Orchestrator {
                             let _ = updates.send(AgentUpdate::ToolStarted {
                                 tool: tool.clone(), argv: argv.clone(),
                             });
-                            let output = self.runner.run(&tool, &argv);
+                            let output = self.run_cached(&tool, &argv);
                             store.append(Event::new(
                                 ws, subagent_phase, EventKind::ToolOutput,
                                 subagent_actor.clone(), Author::Agent,
@@ -490,7 +515,7 @@ impl Orchestrator {
                         Decision::NeedsApproval => {
                             if self.autonomous.load(Ordering::SeqCst) {
                                 let _ = updates.send(AgentUpdate::ToolStarted { tool: tool.clone(), argv: argv.clone() });
-                                let output = self.runner.run(&tool, &argv);
+                                let output = self.run_cached(&tool, &argv);
                                 let _ = updates.send(AgentUpdate::ToolOutput { text: output.clone() });
                                 output
                             } else {
@@ -504,20 +529,20 @@ impl Orchestrator {
                                 match rx.await {
                                     Ok(ApprovalOutcome::ApproveOnce) => {
                                         let _ = updates.send(AgentUpdate::ToolStarted { tool: tool.clone(), argv: argv.clone() });
-                                        let output = self.runner.run(&tool, &argv);
+                                        let output = self.run_cached(&tool, &argv);
                                         let _ = updates.send(AgentUpdate::ToolOutput { text: output.clone() });
                                         output
                                     }
                                     Ok(ApprovalOutcome::ApproveEdited(new_argv)) => {
                                         let _ = updates.send(AgentUpdate::ToolStarted { tool: tool.clone(), argv: new_argv.clone() });
-                                        let output = self.runner.run(&tool, &new_argv);
+                                        let output = self.run_cached(&tool, &new_argv);
                                         let _ = updates.send(AgentUpdate::ToolOutput { text: output.clone() });
                                         output
                                     }
                                     Ok(ApprovalOutcome::AlwaysAllow(rule)) => {
                                         store.add_allow_rule(&rule)?;
                                         let _ = updates.send(AgentUpdate::ToolStarted { tool: tool.clone(), argv: argv.clone() });
-                                        let output = self.runner.run(&tool, &argv);
+                                        let output = self.run_cached(&tool, &argv);
                                         let _ = updates.send(AgentUpdate::ToolOutput { text: output.clone() });
                                         output
                                     }
@@ -656,7 +681,7 @@ impl Orchestrator {
         ))?;
         let _ = updates.send(AgentUpdate::ToolStarted { tool: tool.to_string(), argv: argv.to_vec() });
 
-        let output = self.runner.run(tool, argv);
+        let output = self.run_cached(tool, argv);
 
         store.append(Event::new(
             ws,
@@ -739,13 +764,53 @@ fn collect_text(content: &[Content]) -> String {
 }
 
 /// Extract `(tool, argv)` from a `run_command` tool call. `argv` excludes the tool name.
+///
+/// Defends against two recurring model mistakes:
+/// 1. Nesting the MCP tool name into the `tool` field (`tool="run_command"`), which used to
+///    produce `failed to run run_command`.
+/// 2. Using shell pipes/redirects (`| > >> < && || ;`) with a non-shell tool — those tokens
+///    were passed as literal argv and silently broke. We collapse such calls into `bash -c`.
 fn parse_run_command(call: &ToolCall) -> (String, Vec<String>) {
-    let tool = call.arguments["tool"].as_str().unwrap_or_default().to_string();
-    let argv = call.arguments["argv"]
+    let mut tool = call.arguments["tool"].as_str().unwrap_or_default().to_string();
+    let mut argv: Vec<String> = call.arguments["argv"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
+
+    // Unwrap a nested MCP tool name: tool="run_command", argv=["nmap", "-sV", ...].
+    while (tool == "run_command" || tool == "run") && !argv.is_empty() {
+        tool = argv.remove(0);
+    }
+
+    if needs_shell(&tool, &argv) {
+        let line = std::iter::once(tool.as_str())
+            .chain(argv.iter().map(|s| s.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return ("bash".to_string(), vec!["-c".to_string(), line]);
+    }
+
     (tool, argv)
+}
+
+/// True when the call uses shell pipes/redirects but the tool isn't itself a shell, so it must
+/// be re-issued under `bash -c`. Windows commands already route through PowerShell in the runner.
+fn needs_shell(tool: &str, argv: &[String]) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    let base = tool.rsplit(['/', '\\']).next().unwrap_or(tool);
+    if matches!(base, "bash" | "sh" | "zsh" | "dash" | "pwsh" | "powershell" | "cmd" | "sudo") {
+        return false;
+    }
+    argv.iter().any(|a| {
+        a == "|" || a == "<" || a == ">" || a == ">>" || a == "&&" || a == "||" || a == ";"
+            || a.starts_with("2>")
+            || a.contains('|')
+            || a.contains('>')
+            || a.contains("$(")
+            || a.contains('`')
+    })
 }
 
 fn system_prompt(phase: Phase, scope: &ScopeRules, notes: &[tianji_types::Event]) -> String {
@@ -802,8 +867,13 @@ fn system_prompt(phase: Phase, scope: &ScopeRules, notes: &[tianji_types::Event]
          noteworthy security issue, call record_finding immediately with severity \
          (critical/high/medium/low/info), the affected target (e.g. 192.168.1.25:22/ssh), \
          and a concise one-line summary. \
-         IMPORTANT: do NOT re-run commands whose output is already in the conversation history — \
-         use those results directly instead of repeating scans. \
+         EFFICIENCY (critical — wasted commands cost time and tokens): \
+         (1) Do NOT re-run a scan or request whose output is already in the conversation — read \
+         the earlier result instead. One full nmap port scan per host is enough; never repeat it. \
+         (2) Before delegating, check what is already known; give sub-agents a NARROW objective and \
+         tell them to build on existing results, not redo recon. \
+         (3) Pipes/redirects need a shell: use tool=\"bash\", argv=[\"-c\", \"<full line>\"]. \
+         (4) The tool name is the bare executable (e.g. \"nmap\"), never \"run_command\". \
          Stay strictly within the engagement scope — never target hosts outside it. \
          {os_hint} {phase_hint}"
     )
@@ -817,6 +887,37 @@ mod tests {
     use std::sync::Mutex;
     use tianji_llm::{LlmError, LlmProvider};
     use tianji_types::{ScopeRules, ToolSpec};
+
+    fn tool_call(tool: &str, argv: &[&str]) -> ToolCall {
+        ToolCall {
+            call_id: "t1".into(),
+            name: "run_command".into(),
+            arguments: json!({ "tool": tool, "argv": argv }),
+        }
+    }
+
+    #[test]
+    fn parse_unwraps_nested_run_command() {
+        let (tool, argv) = parse_run_command(&tool_call("run_command", &["nmap", "-sV", "10.0.0.1"]));
+        assert_eq!(tool, "nmap");
+        assert_eq!(argv, vec!["-sV", "10.0.0.1"]);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn parse_wraps_pipes_into_bash() {
+        let (tool, argv) = parse_run_command(&tool_call("curl", &["-s", "http://x/", "|", "head"]));
+        assert_eq!(tool, "bash");
+        assert_eq!(argv, vec!["-c", "curl -s http://x/ | head"]);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn parse_leaves_plain_commands_alone() {
+        let (tool, argv) = parse_run_command(&tool_call("nmap", &["-sC", "-sV", "10.0.0.1"]));
+        assert_eq!(tool, "nmap");
+        assert_eq!(argv, vec!["-sC", "-sV", "10.0.0.1"]);
+    }
 
     /// A scripted provider: each `run_turn` returns the next pre-baked round of events.
     struct ScriptedProvider {
