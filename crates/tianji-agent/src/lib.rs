@@ -77,6 +77,9 @@ pub enum AgentUpdate {
 /// command runner; borrows the workspace store per turn.
 pub struct Orchestrator {
     provider: Arc<dyn LlmProvider>,
+    /// Provider used for delegated sub-agents. Defaults to `provider`, but the host wires a
+    /// cheaper model here (sub-agents do focused grunt work — paying Opus rates for it is waste).
+    subagent_provider: Arc<dyn LlmProvider>,
     gate: Arc<ApprovalGate>,
     mcp: McpHost,
     runner: Arc<dyn CommandRunner>,
@@ -103,6 +106,7 @@ impl Orchestrator {
         let mut histories = HashMap::new();
         histories.insert("default".to_string(), Vec::new());
         Self {
+            subagent_provider: provider.clone(),
             provider,
             gate: Arc::new(ApprovalGate::default()),
             mcp: McpHost::new(),
@@ -140,6 +144,19 @@ impl Orchestrator {
     /// Inject a custom command runner (used in tests to avoid spawning real processes).
     pub fn with_runner(mut self, runner: Arc<dyn CommandRunner>) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Use a separate (typically cheaper) provider for delegated sub-agents.
+    pub fn with_subagent_provider(mut self, provider: Arc<dyn LlmProvider>) -> Self {
+        self.subagent_provider = provider;
+        self
+    }
+
+    /// Share the cancellation flag with an externally-owned atom so it can be propagated to the
+    /// command runner — letting Stop interrupt an in-flight tool, not just the round loop.
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancelled = cancel;
         self
     }
 
@@ -228,7 +245,7 @@ impl Orchestrator {
             history_before_len = history.len();
             // System prompt is rebuilt fresh each turn (scope/phase/notes may have changed).
             let mut msgs = vec![
-                Message { role: Role::System, content: vec![text(system_prompt(phase, &scope, &notes))] },
+                Message { role: Role::System, content: vec![text(system_prompt(phase, &scope, &notes, self.free_mode.load(Ordering::SeqCst)))] },
             ];
             msgs.extend(history.clone());
             msgs
@@ -376,7 +393,7 @@ impl Orchestrator {
 
         let sys = format!(
             "{}{recalled_hint}",
-            system_prompt(subagent_phase, &scope, &notes)
+            system_prompt(subagent_phase, &scope, &notes, self.free_mode.load(Ordering::SeqCst))
         );
 
         let mut messages = vec![
@@ -400,7 +417,7 @@ impl Orchestrator {
             ContextAssembler::cap_tool_output(&mut messages);
             let trimmed = assembler.trim_to_budget(&messages);
             let mut stream = self
-                .provider
+                .subagent_provider
                 .run_turn(&trimmed, self.mcp.subagent_specs())
                 .await
                 .map_err(|e| AgentError::Llm(e.to_string()))?;
@@ -813,7 +830,12 @@ fn needs_shell(tool: &str, argv: &[String]) -> bool {
     })
 }
 
-fn system_prompt(phase: Phase, scope: &ScopeRules, notes: &[tianji_types::Event]) -> String {
+fn system_prompt(
+    phase: Phase,
+    scope: &ScopeRules,
+    notes: &[tianji_types::Event],
+    free_mode: bool,
+) -> String {
     let phase_hint = match phase {
         Phase::Recon => "You are in the RECON phase: enumerate hosts/services with read-only tools.",
         Phase::Hypothesis => "You are in the HYPOTHESIS phase: reason about likely weaknesses.",
@@ -859,6 +881,29 @@ fn system_prompt(phase: Phase, scope: &ScopeRules, notes: &[tianji_types::Event]
          NOPASSWD sudo is configured."
     };
 
+    // Missing-tool policy depends on the mode. OPEN mode = the operator's lab/own box, so the
+    // agent may install what it needs; CONTROLLED mode = don't touch the system, just advise.
+    let install_hint = if free_mode {
+        if cfg!(windows) {
+            "OPEN MODE: if a required tool is missing (\"command not found\"), install it yourself \
+             before retrying — prefer non-interactive package managers (`choco install -y <pkg>`, \
+             `winget install --silent <pkg>`, `pip install <pkg>`) or `git clone` the project. \
+             Never get stuck repeating a command for a tool that isn't installed."
+        } else {
+            "OPEN MODE: if a required tool is missing (\"command not found\"), install it yourself \
+             before retrying — use the platform package manager non-interactively \
+             (`sudo apt-get install -y <pkg>`, `sudo apt update` first if needed, or pip/gem/go \
+             install), or `git clone` the repo and run it. Never get stuck repeating a command for \
+             a tool that isn't installed."
+        }
+    } else {
+        "CONTROLLED MODE: you must NOT install software or modify the operator's machine. If a \
+         required tool is missing (\"command not found\"), do NOT keep retrying it — state which \
+         tool is missing and the exact command the operator should run to install it (e.g. \
+         `sudo apt-get install -y gobuster`), then continue making progress with the tools that \
+         ARE available."
+    };
+
     format!(
         "You are an assistant to an authorized penetration tester. \
          {scope_hint}{notes_hint} \
@@ -867,6 +912,14 @@ fn system_prompt(phase: Phase, scope: &ScopeRules, notes: &[tianji_types::Event]
          noteworthy security issue, call record_finding immediately with severity \
          (critical/high/medium/low/info), the affected target (e.g. 192.168.1.25:22/ssh), \
          and a concise one-line summary. \
+         BE TERSE: reason internally in as few words as possible — a sentence or two, never \
+         paragraphs. Do NOT narrate your plan, restate command output back to the operator, or \
+         write long commentary. Spend tokens on tool calls and findings, not prose. \
+         STRATEGY: when work splits into independent streams (different hosts, or recon vs. web \
+         vs. exploit on the same target), delegate those streams to sub-agents via \
+         delegate_to_agent and let them run in parallel rather than doing everything yourself in \
+         one long serial loop. Delegation is the DEFAULT for separable work — efficiency rule (2) \
+         is about scoping each sub-agent tightly, NOT about avoiding delegation. \
          EFFICIENCY (critical — wasted commands cost time and tokens): \
          (1) Do NOT re-run a scan or request whose output is already in the conversation — read \
          the earlier result instead. One full nmap port scan per host is enough; never repeat it. \
@@ -875,7 +928,7 @@ fn system_prompt(phase: Phase, scope: &ScopeRules, notes: &[tianji_types::Event]
          (3) Pipes/redirects need a shell: use tool=\"bash\", argv=[\"-c\", \"<full line>\"]. \
          (4) The tool name is the bare executable (e.g. \"nmap\"), never \"run_command\". \
          Stay strictly within the engagement scope — never target hosts outside it. \
-         {os_hint} {phase_hint}"
+         {os_hint} {install_hint} {phase_hint}"
     )
 }
 
@@ -917,6 +970,27 @@ mod tests {
         let (tool, argv) = parse_run_command(&tool_call("nmap", &["-sC", "-sV", "10.0.0.1"]));
         assert_eq!(tool, "nmap");
         assert_eq!(argv, vec!["-sC", "-sV", "10.0.0.1"]);
+    }
+
+    #[test]
+    fn open_mode_lets_the_agent_install_tools() {
+        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], true);
+        assert!(p.contains("OPEN MODE"));
+        assert!(p.to_lowercase().contains("install it yourself"));
+    }
+
+    #[test]
+    fn controlled_mode_forbids_install_and_advises_operator() {
+        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false);
+        assert!(p.contains("CONTROLLED MODE"));
+        assert!(p.contains("must NOT install"));
+    }
+
+    #[test]
+    fn prompt_makes_delegation_the_default() {
+        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false);
+        assert!(p.contains("delegate_to_agent"));
+        assert!(p.contains("DEFAULT for separable work"));
     }
 
     /// A scripted provider: each `run_turn` returns the next pre-baked round of events.

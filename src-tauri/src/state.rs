@@ -90,6 +90,16 @@ impl AppState {
     }
 }
 
+/// Model to use for delegated sub-agents: never Opus. If the operator picked Opus for the
+/// orchestrator, sub-agents drop to Sonnet; any other (already cheaper) choice is kept as-is.
+fn subagent_model_for(model: &str) -> String {
+    if model.contains("opus") {
+        "claude-sonnet-4-6".to_string()
+    } else {
+        model.to_string()
+    }
+}
+
 /// The workspace currently in focus. Switching swaps this whole bundle (store, scope, agent).
 pub struct CurrentWorkspace {
     pub meta: WorkspaceMeta,
@@ -110,10 +120,22 @@ impl CurrentWorkspace {
     ) -> Self {
         let key = crate::secrets::get_api_key("anthropic").ok().flatten().unwrap_or_default();
         let sudo_pw = crate::secrets::get_api_key("sudo").ok().flatten();
-        let provider = ClaudeProvider::new(key).with_model(model);
-        let runner = tianji_agent::ProcessRunner::with_sudo_password(sudo_pw);
+        let provider = ClaudeProvider::new(key.clone()).with_model(model);
+
+        // Sub-agents do focused grunt work — never run them on Opus. Cap them at Sonnet (if the
+        // operator already picked a non-Opus model, reuse it). This is a big cost lever: an
+        // engagement can spawn many sub-agent rounds.
+        let subagent_provider = ClaudeProvider::new(key).with_model(subagent_model_for(model));
+
+        // One cancellation flag shared by the orchestrator AND the command runner, so Stop
+        // interrupts an in-flight tool (not just the round loop between tools).
+        let cancel = Arc::new(AtomicBool::new(false));
+        let runner = tianji_agent::ProcessRunner::with_sudo_password(sudo_pw)
+            .with_cancel(cancel.clone());
         let orchestrator = Orchestrator::new(Arc::new(provider))
+            .with_subagent_provider(Arc::new(subagent_provider))
             .with_runner(Arc::new(runner))
+            .with_cancel(cancel)
             .with_flags(autonomous, free_mode);
         Self { meta, store, orchestrator }
     }

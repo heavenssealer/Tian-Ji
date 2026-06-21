@@ -72,11 +72,20 @@ impl LlmProvider for ClaudeProvider {
         }
 
         let (system, msgs) = translate_messages(messages);
+
+        // Prompt caching — the single biggest cost lever for a long agentic session. Every turn
+        // re-sends the same large, stable prefix (all tool schemas + the system prompt). One
+        // `cache_control` breakpoint on the system block caches everything before it (tools come
+        // first in the cache order, then system), so from the second turn on that prefix is a
+        // cache *read* at ~10% of the input price instead of full-price input tokens. The 5-minute
+        // TTL comfortably covers a back-to-back tool loop. We do NOT cache the message tail: the
+        // context assembler trims/reorders history when it exceeds budget, which would churn the
+        // cache and waste cache-write cost — system+tools is the always-stable, always-hit chunk.
         let body = json!({
             "model": self.model,
             "max_tokens": 4096,
             "stream": true,
-            "system": system,
+            "system": cached_system_block(&system),
             "messages": msgs,
             "tools": tools.iter().map(translate_tool).collect::<Vec<_>>(),
         });
@@ -246,6 +255,17 @@ fn str_field(v: &Value) -> String {
     v.as_str().unwrap_or("").to_string()
 }
 
+/// Build the `system` field as a single text block carrying a `cache_control` breakpoint, so the
+/// tools+system prefix is served from Anthropic's prompt cache on every turn after the first.
+/// An empty system collapses to `[]` (no block to cache, and an empty text block is rejected).
+fn cached_system_block(system: &str) -> Value {
+    if system.is_empty() {
+        json!([])
+    } else {
+        json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }])
+    }
+}
+
 fn translate_messages(messages: &[Message]) -> (String, Vec<Value>) {
     let mut system = String::new();
     let mut out = Vec::new();
@@ -291,4 +311,24 @@ fn translate_tool(t: &ToolSpec) -> Value {
         "description": t.description,
         "input_schema": t.input_schema,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_block_carries_cache_control() {
+        let block = cached_system_block("you are a pentest assistant");
+        let first = &block[0];
+        assert_eq!(first["type"], "text");
+        assert_eq!(first["text"], "you are a pentest assistant");
+        assert_eq!(first["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn empty_system_collapses_to_empty_array() {
+        let block = cached_system_block("");
+        assert_eq!(block, json!([]));
+    }
 }
