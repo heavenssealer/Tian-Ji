@@ -439,6 +439,7 @@ function ModelSelect() {
         <select
           value={model}
           onChange={(e) => void change(e.target.value)}
+          onFocus={() => void ipc.settingsListModels().then(setModels).catch(() => {})}
           className="w-full cursor-pointer rounded-md border border-base-500 bg-base-800 px-2 py-1 font-mono text-[11px] text-ink-dim outline-none hover:border-base-400 focus:border-accent/50"
         >
           {models.length === 0 && <option>{model || "model"}</option>}

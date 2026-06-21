@@ -8,12 +8,14 @@ export default function SettingsButton() {
   const [key, setKey] = useState("");
   const [hasSudo, setHasSudo] = useState(false);
   const [sudoPw, setSudoPw] = useState("");
+  const [ollamaHost, setOllamaHost] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = () => {
     ipc.settingsHasApiKey().then(setHasKey).catch(() => {});
     ipc.settingsHasSudoPassword().then(setHasSudo).catch(() => {});
+    ipc.settingsGetOllamaHost().then(setOllamaHost).catch(() => {});
   };
 
   useEffect(() => { refresh(); }, []);
@@ -30,6 +32,7 @@ export default function SettingsButton() {
         await ipc.settingsSetSudoPassword(sudoPw.trim());
         setSudoPw("");
       }
+      await ipc.settingsSetOllamaHost(ollamaHost.trim());
       setOpen(false);
       refresh();
     } catch (e) {
@@ -88,6 +91,23 @@ export default function SettingsButton() {
               ? <p className="mt-1 text-[11px] text-ok">Sudo password is set — nmap, tcpdump, etc. run as root automatically.</p>
               : <p className="mt-1 text-[11px] text-ink-faint">Without this, privileged tools require NOPASSWD sudoers or will fail.</p>
             }
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-1.5 block text-[11px] font-medium text-ink-dim">
+              Ollama host <span className="font-normal text-ink-faint">(for local <code>ollama:</code> models)</span>
+            </label>
+            <input
+              type="text"
+              value={ollamaHost}
+              onChange={(e) => setOllamaHost(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && void save()}
+              placeholder="http://localhost:11434"
+              className={fieldClass}
+            />
+            <p className="mt-1 text-[11px] text-ink-faint">
+              Where your Ollama server runs. Use your host's IP/name if the app can't reach it on localhost. Leave blank to reset to the default.
+            </p>
           </div>
 
           {error && <p className="mb-2 text-[11px] text-danger">{error}</p>}

@@ -238,10 +238,55 @@ fn translate_tool(t: &ToolSpec) -> Value {
     })
 }
 
+// ── model discovery ──────────────────────────────────────────────────────────────
+
+/// Ask a running Ollama server which models it has pulled (`GET /api/tags`). Returns the bare
+/// model names (e.g. "llama3.1:latest"); the caller prefixes them with `ollama:`. Best-effort —
+/// a short timeout keeps the UI responsive when no server is running, and errors are surfaced so
+/// the caller can fall back to a static list.
+pub async fn list_ollama_models(base_url: &str) -> Result<Vec<String>> {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let resp = client.get(&url).send().await.map_err(|e| LlmError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(LlmError::Provider(format!("{}: /api/tags", resp.status())));
+    }
+    let body: Value = resp.json().await.map_err(|e| LlmError::Http(e.to_string()))?;
+    Ok(parse_tag_names(&body))
+}
+
+fn parse_tag_names(body: &Value) -> Vec<String> {
+    body["models"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tianji_types::ToolCall as TC;
+
+    #[test]
+    fn parse_tag_names_extracts_model_names() {
+        let body = json!({
+            "models": [
+                { "name": "llama3.1:latest", "size": 1 },
+                { "name": "qwen2.5-coder:7b" },
+                { "notname": "ignored" }
+            ]
+        });
+        assert_eq!(parse_tag_names(&body), vec!["llama3.1:latest", "qwen2.5-coder:7b"]);
+    }
+
+    #[test]
+    fn parse_tag_names_handles_missing_or_empty() {
+        assert!(parse_tag_names(&json!({})).is_empty());
+        assert!(parse_tag_names(&json!({ "models": [] })).is_empty());
+    }
 
     #[test]
     fn translates_tool_to_openai_function() {

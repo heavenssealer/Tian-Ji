@@ -18,6 +18,17 @@ fn estimate(chars: usize) -> usize {
     (chars / 4).max(1)
 }
 
+/// Move `start` to an index whose message is a `user` turn, so the trimmed window begins on a real
+/// user message (never a dangling tool-result or an assistant turn). Prefers the nearest user at or
+/// after `start`; failing that, backs up to the most recent user before it (keeps the objective /
+/// current prompt anchored). Returns `messages.len()` only if there is no user message at all.
+fn anchor_to_user(messages: &[Message], start: usize) -> usize {
+    if let Some(i) = (start..messages.len()).find(|&i| messages[i].role == Role::User) {
+        return i;
+    }
+    (1..start).rev().find(|&i| messages[i].role == Role::User).unwrap_or(messages.len())
+}
+
 fn message_tokens(m: &Message) -> usize {
     let content_cost: usize = m.content.iter().map(|c| {
         let chars = match c {
@@ -42,8 +53,15 @@ impl Default for ContextAssembler {
 }
 
 impl ContextAssembler {
-    /// Trim `messages` so the cumulative token estimate fits under `max_tokens`.
-    /// Always keeps messages[0] (system prompt). Drops oldest non-system messages first.
+    /// Trim `messages` so the cumulative token estimate fits under `max_tokens`, keeping the
+    /// system prompt plus a **contiguous suffix** of the conversation.
+    ///
+    /// Contiguity matters: the Anthropic API rejects a `tool_result` block whose matching
+    /// `tool_use` isn't in the immediately-preceding message, and rejects a conversation that
+    /// begins with a dangling `tool_result`. Dropping arbitrary middle messages (or starting the
+    /// window on a tool-result) would split those pairs. So we keep the newest messages that fit,
+    /// then anchor the window to a `user` turn — guaranteeing every kept `tool_result` still has
+    /// its `tool_use`, and the first sent message is a real user message.
     pub fn trim_to_budget(&self, messages: &[Message]) -> Vec<Message> {
         if messages.is_empty() {
             return Vec::new();
@@ -51,20 +69,23 @@ impl ContextAssembler {
         let sys_cost = message_tokens(&messages[0]);
         let mut remaining = self.max_tokens.saturating_sub(sys_cost);
 
-        // Walk from newest to oldest (excluding system prompt at index 0).
-        let mut kept: Vec<usize> = Vec::new();
-        for (i, msg) in messages[1..].iter().enumerate().rev() {
-            let cost = message_tokens(msg);
-            if cost <= remaining {
-                remaining -= cost;
-                kept.push(i + 1);
+        // Newest→oldest, stop at the first message that doesn't fit (keep a contiguous suffix).
+        let mut start = messages.len();
+        for i in (1..messages.len()).rev() {
+            let cost = message_tokens(&messages[i]);
+            if cost > remaining {
+                break;
             }
+            remaining -= cost;
+            start = i;
         }
-        kept.sort();
 
-        let mut out = vec![messages[0].clone()];
-        for i in kept {
-            out.push(messages[i].clone());
+        start = anchor_to_user(messages, start);
+
+        let mut out = Vec::with_capacity(1 + messages.len().saturating_sub(start));
+        out.push(messages[0].clone());
+        if start < messages.len() {
+            out.extend(messages[start..].iter().cloned());
         }
         out
     }
@@ -146,5 +167,77 @@ fn kind_label(k: EventKind) -> &'static str {
         EventKind::ToolOutput => "tool_output",
         EventKind::AgentMsg   => "agent",
         _                     => "event",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tianji_types::ToolCall;
+
+    fn system(t: &str) -> Message {
+        Message { role: Role::System, content: vec![Content::Text { text: t.into() }] }
+    }
+    fn user(t: &str) -> Message {
+        Message { role: Role::User, content: vec![Content::Text { text: t.into() }] }
+    }
+    fn assistant_tool(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![Content::ToolUse {
+                call: ToolCall { call_id: id.into(), name: "run_command".into(), arguments: serde_json::json!({}) },
+            }],
+        }
+    }
+    fn tool_result(id: &str) -> Message {
+        Message { role: Role::Tool, content: vec![Content::ToolResult { call_id: id.into(), output: "out".into() }] }
+    }
+
+    /// The Anthropic invariants every trimmed window must satisfy.
+    fn assert_valid(out: &[Message]) {
+        assert_eq!(out[0].role, Role::System, "system stays first");
+        if out.len() > 1 {
+            assert_eq!(out[1].role, Role::User, "conversation must begin on a user turn");
+        }
+        for i in 1..out.len() {
+            if out[i].role == Role::Tool {
+                assert_eq!(out[i - 1].role, Role::Assistant, "tool_result must follow an assistant");
+                assert!(
+                    out[i - 1].content.iter().any(|c| matches!(c, Content::ToolUse { .. })),
+                    "the preceding assistant must carry a tool_use",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trim_drops_oldest_pairs_but_stays_valid() {
+        let pad = "padding ".repeat(40); // make early user turns expensive
+        let messages = vec![
+            system("sys"),
+            user(&format!("question one {pad}")),
+            assistant_tool("toolu_A"),
+            tool_result("toolu_A"),
+            user(&format!("question two {pad}")),
+            assistant_tool("toolu_B"),
+            tool_result("toolu_B"),
+            user("current question"),
+        ];
+        let out = ContextAssembler { max_tokens: 20 }.trim_to_budget(&messages);
+        assert!(out.len() < messages.len(), "trimming should have engaged");
+        assert_valid(&out);
+    }
+
+    #[test]
+    fn trim_anchors_back_to_user_when_suffix_starts_on_a_tool_result() {
+        // A sub-agent-style tail ending on an open tool pair; budget only fits the tool_result,
+        // so the naive contiguous suffix would start on a dangling tool_result. Anchoring must
+        // back up to the objective and keep the pair intact.
+        let obj = "enumerate the host ".repeat(8);
+        let messages =
+            vec![system("s"), user(&obj), assistant_tool("toolu_A"), tool_result("toolu_A")];
+        let out = ContextAssembler { max_tokens: 12 }.trim_to_budget(&messages);
+        assert_valid(&out);
+        assert_eq!(out.len(), 4, "the pair is pulled back in to stay valid");
     }
 }

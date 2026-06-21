@@ -70,6 +70,8 @@ fn main() {
             commands::settings::settings_list_models,
             commands::settings::settings_get_model,
             commands::settings::settings_set_model,
+            commands::settings::settings_get_ollama_host,
+            commands::settings::settings_set_ollama_host,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tiān Jī");

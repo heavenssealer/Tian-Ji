@@ -62,8 +62,22 @@ pub async fn settings_has_sudo_password(_state: State<'_, AppState>) -> AppResul
 }
 
 #[tauri::command]
-pub async fn settings_list_models(_state: State<'_, AppState>) -> AppResult<Vec<String>> {
-    Ok(MODELS.iter().map(|s| s.to_string()).collect())
+pub async fn settings_list_models(state: State<'_, AppState>) -> AppResult<Vec<String>> {
+    let mut out: Vec<String> = MODELS.iter().map(|s| s.to_string()).collect();
+
+    // Merge in whatever models the configured Ollama host currently has pulled, so `ollama pull`
+    // is enough to make a model selectable — no recompile. Best-effort: if Ollama isn't reachable
+    // we just return the static list.
+    let host = crate::state::ollama_host(&state.app);
+    if let Ok(models) = tianji_llm::list_ollama_models(&host).await {
+        for name in models {
+            let id = format!("ollama:{name}");
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -74,5 +88,22 @@ pub async fn settings_get_model(state: State<'_, AppState>) -> AppResult<String>
 #[tauri::command]
 pub async fn settings_set_model(state: State<'_, AppState>, model: String) -> AppResult<()> {
     state.app.set_setting("model", &model)?;
+    rebuild_current(&state)
+}
+
+/// The configured Ollama endpoint (defaults to `http://localhost:11434`).
+#[tauri::command]
+pub async fn settings_get_ollama_host(state: State<'_, AppState>) -> AppResult<String> {
+    Ok(crate::state::ollama_host(&state.app))
+}
+
+/// Point the local-model backend at a specific Ollama host. An empty value resets to the default.
+/// Rebuilds the open workspace so a running `ollama:` model picks up the new host immediately.
+#[tauri::command]
+pub async fn settings_set_ollama_host(state: State<'_, AppState>, host: String) -> AppResult<()> {
+    let host = host.trim().trim_end_matches('/');
+    state
+        .app
+        .set_setting("ollama_host", if host.is_empty() { crate::state::DEFAULT_OLLAMA_HOST } else { host })?;
     rebuild_current(&state)
 }

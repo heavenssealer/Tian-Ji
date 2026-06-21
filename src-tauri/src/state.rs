@@ -121,11 +121,24 @@ fn subagent_model_for(model: &str) -> String {
     }
 }
 
+/// Default Ollama endpoint when the operator hasn't set one.
+pub const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
+
+/// The configured Ollama host (persisted in app settings), normalized without a trailing slash.
+pub fn ollama_host(app: &AppStore) -> String {
+    app.get_setting("ollama_host")
+        .ok()
+        .flatten()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_OLLAMA_HOST.to_string())
+}
+
 /// Build the right provider for a model id. A `ollama:<name>` prefix selects the local Ollama
-/// backend (free, no API key); anything else is a cloud Claude model.
-fn build_provider(model: &str, api_key: String) -> Arc<dyn LlmProvider> {
+/// backend (free, no API key) at `ollama_host`; anything else is a cloud Claude model.
+fn build_provider(model: &str, api_key: String, ollama_host: &str) -> Arc<dyn LlmProvider> {
     if let Some(local) = model.strip_prefix("ollama:") {
-        Arc::new(OllamaProvider::new(local.trim()))
+        Arc::new(OllamaProvider::new(local.trim()).with_base_url(ollama_host))
     } else {
         Arc::new(ClaudeProvider::new(api_key).with_model(model))
     }
@@ -156,11 +169,12 @@ impl CurrentWorkspace {
     ) -> Self {
         let key = crate::secrets::get_api_key("anthropic").ok().flatten().unwrap_or_default();
         let sudo_pw = crate::secrets::get_api_key("sudo").ok().flatten();
-        let provider = build_provider(model, key.clone());
+        let host = ollama_host(app);
+        let provider = build_provider(model, key.clone(), &host);
 
         // Sub-agents do focused grunt work — never run them on Opus. Cap them at Sonnet (or reuse
         // an already-cheaper / local model). A big cost lever: engagements spawn many sub-rounds.
-        let subagent_provider = build_provider(&subagent_model_for(model), key);
+        let subagent_provider = build_provider(&subagent_model_for(model), key, &host);
 
         // One cancellation flag shared by the orchestrator AND the command runner, so Stop
         // interrupts an in-flight tool (not just the round loop between tools).
