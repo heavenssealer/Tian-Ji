@@ -25,6 +25,9 @@ const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 pub struct OllamaProvider {
     base_url: String,
     model: String,
+    /// Context window (`options.num_ctx`) to request. `None` lets Ollama use its (small) default;
+    /// for this agent that truncates the prompt, so the host always sets one.
+    num_ctx: Option<u32>,
     http: reqwest::Client,
 }
 
@@ -33,6 +36,7 @@ impl OllamaProvider {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
+            num_ctx: None,
             http: reqwest::Client::new(),
         }
     }
@@ -41,6 +45,28 @@ impl OllamaProvider {
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
+    }
+
+    /// Set the context window Ollama should allocate for this model.
+    pub fn with_num_ctx(mut self, num_ctx: u32) -> Self {
+        self.num_ctx = Some(num_ctx);
+        self
+    }
+
+    /// Build the `/api/chat` request body. Adds `options.num_ctx` when a window is configured —
+    /// without it Ollama defaults to ~2–4k and silently drops the front of the prompt (system
+    /// prompt + tool defs), breaking the agent.
+    fn request_body(&self, messages: &[Message], tools: &[ToolSpec]) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "messages": translate_messages(messages),
+            "tools": tools.iter().map(translate_tool).collect::<Vec<_>>(),
+            "stream": true,
+        });
+        if let Some(n) = self.num_ctx {
+            body["options"] = json!({ "num_ctx": n });
+        }
+        body
     }
 }
 
@@ -51,12 +77,7 @@ impl LlmProvider for OllamaProvider {
         messages: &[Message],
         tools: &[ToolSpec],
     ) -> Result<BoxStream<'static, AgentEvent>> {
-        let body = json!({
-            "model": self.model,
-            "messages": translate_messages(messages),
-            "tools": tools.iter().map(translate_tool).collect::<Vec<_>>(),
-            "stream": true,
-        });
+        let body = self.request_body(messages, tools);
 
         let resp = self
             .http
@@ -269,6 +290,15 @@ fn parse_tag_names(body: &Value) -> Vec<String> {
 mod tests {
     use super::*;
     use tianji_types::ToolCall as TC;
+
+    #[test]
+    fn num_ctx_is_sent_only_when_configured() {
+        let with = OllamaProvider::new("llama3.1").with_num_ctx(32768);
+        assert_eq!(with.request_body(&[], &[])["options"]["num_ctx"], 32768);
+
+        let without = OllamaProvider::new("llama3.1");
+        assert!(without.request_body(&[], &[]).get("options").is_none());
+    }
 
     #[test]
     fn parse_tag_names_extracts_model_names() {

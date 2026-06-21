@@ -56,4 +56,6 @@ export const ipc = {
   settingsSetModel: (model: string) => invoke<void>("settings_set_model", { model }),
   settingsGetOllamaHost: () => invoke<string>("settings_get_ollama_host"),
   settingsSetOllamaHost: (host: string) => invoke<void>("settings_set_ollama_host", { host }),
+  settingsGetOllamaNumCtx: () => invoke<number>("settings_get_ollama_num_ctx"),
+  settingsSetOllamaNumCtx: (numCtx: number) => invoke<void>("settings_set_ollama_num_ctx", { numCtx }),
 };

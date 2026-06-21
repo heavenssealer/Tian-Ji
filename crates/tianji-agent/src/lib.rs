@@ -156,6 +156,9 @@ pub struct Orchestrator {
     /// always injected into the system prompt. Per-workspace facts are read from the store per
     /// turn; these aren't in the workspace DB, so the orchestrator caches them here.
     global_facts: std::sync::Mutex<Vec<String>>,
+    /// Max tokens of context to pack per turn. Defaults conservatively (cost control on cloud
+    /// models); the host raises it to match a local model's configured context window.
+    context_budget: usize,
 }
 
 impl Orchestrator {
@@ -179,6 +182,7 @@ impl Orchestrator {
             active_session: std::sync::Mutex::new("default".to_string()),
             command_cache: std::sync::Mutex::new(HashMap::new()),
             global_facts: std::sync::Mutex::new(Vec::new()),
+            context_budget: 16_000,
         }
     }
 
@@ -186,6 +190,16 @@ impl Orchestrator {
     /// distillation pass).
     pub fn set_global_facts(&self, facts: Vec<String>) {
         *self.global_facts.lock().unwrap() = facts;
+    }
+
+    /// Set how many tokens of context to pack per turn (e.g. matched to a local model's window).
+    pub fn with_context_budget(mut self, budget: usize) -> Self {
+        self.context_budget = budget.max(2_000);
+        self
+    }
+
+    fn assembler(&self) -> ContextAssembler {
+        ContextAssembler { max_tokens: self.context_budget }
     }
 
     /// Run a tool through the runner, deduping identical read-only commands within a session.
@@ -448,7 +462,7 @@ impl Orchestrator {
                 content: vec![text(format!("Recent activity:\n{}", distill_transcript(&events)))],
             },
         ];
-        let trimmed = ContextAssembler::default().trim_to_budget(&messages);
+        let trimmed = self.assembler().trim_to_budget(&messages);
         let Ok(mut stream) = self.subagent_provider.run_turn(&trimmed, &[]).await else {
             return Vec::new();
         };
@@ -520,7 +534,7 @@ impl Orchestrator {
         // Repeated-command counts for this prompt-cycle, feeding the loop guard.
         let mut loop_counts: HashMap<String, usize> = HashMap::new();
 
-        let assembler = ContextAssembler::default();
+        let assembler = self.assembler();
         for _round in 0..MAX_ROUNDS {
             if self.cancelled.load(Ordering::SeqCst) {
                 break;
@@ -714,7 +728,7 @@ impl Orchestrator {
             Message { role: Role::User,   content: vec![text(objective.clone())] },
         ];
 
-        let assembler = ContextAssembler::default();
+        let assembler = self.assembler();
         let mut tokens_used: u32 = 0;
 
         for _round in 0..MAX_SUBAGENT_ROUNDS {

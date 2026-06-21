@@ -9,6 +9,7 @@ export default function SettingsButton() {
   const [hasSudo, setHasSudo] = useState(false);
   const [sudoPw, setSudoPw] = useState("");
   const [ollamaHost, setOllamaHost] = useState("");
+  const [numCtx, setNumCtx] = useState(16384);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -16,6 +17,7 @@ export default function SettingsButton() {
     ipc.settingsHasApiKey().then(setHasKey).catch(() => {});
     ipc.settingsHasSudoPassword().then(setHasSudo).catch(() => {});
     ipc.settingsGetOllamaHost().then(setOllamaHost).catch(() => {});
+    ipc.settingsGetOllamaNumCtx().then(setNumCtx).catch(() => {});
   };
 
   useEffect(() => { refresh(); }, []);
@@ -33,6 +35,7 @@ export default function SettingsButton() {
         setSudoPw("");
       }
       await ipc.settingsSetOllamaHost(ollamaHost.trim());
+      await ipc.settingsSetOllamaNumCtx(numCtx);
       setOpen(false);
       refresh();
     } catch (e) {
@@ -107,6 +110,27 @@ export default function SettingsButton() {
             />
             <p className="mt-1 text-[11px] text-ink-faint">
               Where your Ollama server runs. Use your host's IP/name if the app can't reach it on localhost. Leave blank to reset to the default.
+            </p>
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-1.5 block text-[11px] font-medium text-ink-dim">
+              Ollama context window <span className="font-normal text-ink-faint">(num_ctx — tokens)</span>
+            </label>
+            <input
+              type="number"
+              min={4096}
+              step={2048}
+              value={numCtx}
+              onChange={(e) => setNumCtx(Number(e.target.value) || 0)}
+              onKeyDown={(e) => e.key === "Enter" && void save()}
+              placeholder="16384"
+              className={fieldClass}
+            />
+            <p className="mt-1 text-[11px] text-ink-faint">
+              Ollama's default (~2–4k) is too small and silently truncates the prompt. 16k is a good
+              start; raise it (32k+) for long engagements if your model and VRAM allow. Our history
+              budget tracks this value automatically.
             </p>
           </div>
 

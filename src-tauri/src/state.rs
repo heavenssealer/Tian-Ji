@@ -123,6 +123,11 @@ fn subagent_model_for(model: &str) -> String {
 
 /// Default Ollama endpoint when the operator hasn't set one.
 pub const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
+/// Default Ollama context window. Ollama's own default (~2–4k) is far too small for this agent;
+/// 16k comfortably fits the system prompt, tools, and recent history.
+pub const DEFAULT_OLLAMA_NUM_CTX: u32 = 16_384;
+/// Smallest context window we'll accept — below this the agent's own prompt won't fit.
+pub const MIN_OLLAMA_NUM_CTX: u32 = 4_096;
 
 /// The configured Ollama host (persisted in app settings), normalized without a trailing slash.
 pub fn ollama_host(app: &AppStore) -> String {
@@ -134,11 +139,26 @@ pub fn ollama_host(app: &AppStore) -> String {
         .unwrap_or_else(|| DEFAULT_OLLAMA_HOST.to_string())
 }
 
+/// The configured Ollama context window (`num_ctx`), clamped to a usable minimum.
+pub fn ollama_num_ctx(app: &AppStore) -> u32 {
+    app.get_setting("ollama_num_ctx")
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(|n| n.max(MIN_OLLAMA_NUM_CTX))
+        .unwrap_or(DEFAULT_OLLAMA_NUM_CTX)
+}
+
 /// Build the right provider for a model id. A `ollama:<name>` prefix selects the local Ollama
-/// backend (free, no API key) at `ollama_host`; anything else is a cloud Claude model.
-fn build_provider(model: &str, api_key: String, ollama_host: &str) -> Arc<dyn LlmProvider> {
+/// backend (free, no API key) at `ollama_host` with the given context window; anything else is a
+/// cloud Claude model.
+fn build_provider(model: &str, api_key: String, ollama_host: &str, num_ctx: u32) -> Arc<dyn LlmProvider> {
     if let Some(local) = model.strip_prefix("ollama:") {
-        Arc::new(OllamaProvider::new(local.trim()).with_base_url(ollama_host))
+        Arc::new(
+            OllamaProvider::new(local.trim())
+                .with_base_url(ollama_host)
+                .with_num_ctx(num_ctx),
+        )
     } else {
         Arc::new(ClaudeProvider::new(api_key).with_model(model))
     }
@@ -170,11 +190,20 @@ impl CurrentWorkspace {
         let key = crate::secrets::get_api_key("anthropic").ok().flatten().unwrap_or_default();
         let sudo_pw = crate::secrets::get_api_key("sudo").ok().flatten();
         let host = ollama_host(app);
-        let provider = build_provider(model, key.clone(), &host);
+        let num_ctx = ollama_num_ctx(app);
+        let provider = build_provider(model, key.clone(), &host, num_ctx);
 
         // Sub-agents do focused grunt work — never run them on Opus. Cap them at Sonnet (or reuse
         // an already-cheaper / local model). A big cost lever: engagements spawn many sub-rounds.
-        let subagent_provider = build_provider(&subagent_model_for(model), key, &host);
+        let subagent_provider = build_provider(&subagent_model_for(model), key, &host, num_ctx);
+
+        // How much history to pack per turn. On a local model, match its context window (reserving
+        // headroom for the reply); on cloud models stay conservative for cost.
+        let context_budget = if model.starts_with("ollama:") {
+            (num_ctx as usize).saturating_sub(2_048).max(4_000)
+        } else {
+            16_000
+        };
 
         // One cancellation flag shared by the orchestrator AND the command runner, so Stop
         // interrupts an in-flight tool (not just the round loop between tools).
@@ -186,6 +215,7 @@ impl CurrentWorkspace {
             .with_runner(Arc::new(runner))
             .with_cancel(cancel)
             .with_budget(tokens_spent, token_budget)
+            .with_context_budget(context_budget)
             .with_flags(autonomous, free_mode);
         // Restore prior conversations so the agent doesn't start from scratch after a restart,
         // workspace switch, or model/key change (all of which rebuild this bundle).

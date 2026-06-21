@@ -107,3 +107,18 @@ pub async fn settings_set_ollama_host(state: State<'_, AppState>, host: String) 
         .set_setting("ollama_host", if host.is_empty() { crate::state::DEFAULT_OLLAMA_HOST } else { host })?;
     rebuild_current(&state)
 }
+
+/// The configured Ollama context window (`num_ctx`).
+#[tauri::command]
+pub async fn settings_get_ollama_num_ctx(state: State<'_, AppState>) -> AppResult<u32> {
+    Ok(crate::state::ollama_num_ctx(&state.app))
+}
+
+/// Set the Ollama context window. Clamped to a usable minimum, and both the value sent to Ollama
+/// and our own history budget follow it. Rebuilds the open workspace to take effect immediately.
+#[tauri::command]
+pub async fn settings_set_ollama_num_ctx(state: State<'_, AppState>, num_ctx: u32) -> AppResult<()> {
+    let n = num_ctx.max(crate::state::MIN_OLLAMA_NUM_CTX);
+    state.app.set_setting("ollama_num_ctx", &n.to_string())?;
+    rebuild_current(&state)
+}
