@@ -37,7 +37,7 @@ tracing     = "0.1"
 rusqlite    = { version = "0.32", features = ["bundled"] }
 portable-pty = "0.8"
 ipnet        = "2"
-reqwest     = { version = "0.12", features = ["json", "stream"] }
+reqwest     = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 ts-rs       = "10"
 
 [profile.release]
