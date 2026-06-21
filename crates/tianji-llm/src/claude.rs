@@ -22,6 +22,23 @@ use crate::{LlmError, LlmProvider, Result};
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Build the HTTP client with settings that survive flaky networks (notably the HTB/VPN `tun`
+/// interfaces on Kali, where a second request reusing a pooled HTTP/2 connection fails with
+/// "error sending request for url"):
+/// - `pool_max_idle_per_host(0)` — never reuse an idle connection; open a fresh one each turn.
+/// - `http1_only` — avoid HTTP/2 GOAWAY / multiplexing issues over VPN tunnels.
+/// - `tcp_keepalive` — keep the streaming connection alive during long SSE responses.
+/// - `connect_timeout` only (NOT a request timeout, which would abort long streams).
+fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .http1_only()
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 pub struct ClaudeProvider {
     api_key: String,
     model: String,
@@ -33,7 +50,7 @@ impl ClaudeProvider {
         Self {
             api_key,
             model: "claude-opus-4-8".to_string(),
-            http: reqwest::Client::new(),
+            http: build_client(),
         }
     }
 
