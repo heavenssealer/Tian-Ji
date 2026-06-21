@@ -24,6 +24,12 @@ interface AppUiState {
   isRunning: boolean;
   isAutonomous: boolean;
   isFreeMode: boolean;
+  // Standalone mode: when on, a submitted message launches an autonomous goal run instead of a
+  // single chat turn. `goalIteration` tracks the current self-directed cycle while a run is live.
+  isStandalone: boolean;
+  goalIteration: number;
+  // Cumulative token budget cap (0 = unlimited). Persisted backend-side; mirrored here for the UI.
+  tokenBudget: number;
   totalTokens: TokenCount;
   activeAgents: ActiveAgent[];
 
@@ -41,6 +47,8 @@ interface AppUiState {
   setRunning: (v: boolean) => void;
   setAutonomous: (v: boolean) => void;
   setFreeMode: (v: boolean) => void;
+  setStandalone: (v: boolean) => void;
+  setTokenBudget: (n: number) => void;
 }
 
 let sessionCounter = 1;
@@ -57,6 +65,9 @@ export const useAppStore = create<AppUiState>((set, get) => ({
   isRunning: false,
   isAutonomous: false,
   isFreeMode: false,
+  isStandalone: false,
+  goalIteration: 0,
+  tokenBudget: 0,
   totalTokens: { input: 0, output: 0 },
   activeAgents: [{ name: "orchestrator", status: "idle" }],
 
@@ -73,6 +84,8 @@ export const useAppStore = create<AppUiState>((set, get) => ({
       isRunning: false,
       isAutonomous: false,
       isFreeMode: false,
+      isStandalone: false,
+      goalIteration: 0,
       totalTokens: { input: 0, output: 0 },
       activeAgents: [{ name: "orchestrator", status: "idle" }],
     });
@@ -197,6 +210,21 @@ export const useAppStore = create<AppUiState>((set, get) => ({
             ),
           };
         }
+        case "goal_start":
+          return updateChat([
+            ...s.chat,
+            { kind: "finding", text: `🎯 Standalone run started — objective: ${d.text ?? ""}` },
+          ]);
+        case "goal_iteration":
+          return { goalIteration: d.input ?? 0 };
+        case "goal_end":
+          return {
+            goalIteration: 0,
+            ...updateChat([
+              ...s.chat,
+              { kind: "finding", text: `🎯 Standalone run ${d.text ?? "ended"} after ${d.input ?? 0} iteration(s).` },
+            ]),
+          };
         case "turn_end":
           return {
             isRunning: false,
@@ -211,4 +239,6 @@ export const useAppStore = create<AppUiState>((set, get) => ({
 
   setAutonomous: (isAutonomous) => set({ isAutonomous }),
   setFreeMode: (isFreeMode) => set({ isFreeMode }),
+  setStandalone: (isStandalone) => set({ isStandalone }),
+  setTokenBudget: (tokenBudget) => set({ tokenBudget }),
 }));

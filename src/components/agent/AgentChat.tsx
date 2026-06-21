@@ -7,6 +7,11 @@ import ApprovalCard from "./ApprovalCard";
 
 const COLLAPSE_LINES = 10;
 
+// Token budget cap presets the toolbar button cycles through (0 = unlimited).
+const BUDGET_PRESETS = [0, 100_000, 250_000, 500_000, 1_000_000];
+const fmtBudget = (n: number) =>
+  n === 0 ? "off" : n >= 1_000_000 ? `${n / 1_000_000}M` : `${n / 1000}k`;
+
 export default function AgentChat() {
   const [prompt, setPrompt] = useState("");
   const chat = useAppStore((s) => s.chat);
@@ -16,6 +21,11 @@ export default function AgentChat() {
   const setAutonomous = useAppStore((s) => s.setAutonomous);
   const isFreeMode = useAppStore((s) => s.isFreeMode);
   const setFreeMode = useAppStore((s) => s.setFreeMode);
+  const isStandalone = useAppStore((s) => s.isStandalone);
+  const setStandalone = useAppStore((s) => s.setStandalone);
+  const goalIteration = useAppStore((s) => s.goalIteration);
+  const tokenBudget = useAppStore((s) => s.tokenBudget);
+  const setTokenBudget = useAppStore((s) => s.setTokenBudget);
   const totalTokens = useAppStore((s) => s.totalTokens);
   const sessions = useAppStore((s) => s.sessions);
   const currentSessionId = useAppStore((s) => s.currentSessionId);
@@ -38,7 +48,9 @@ export default function AgentChat() {
     setPrompt("");
     setRunning(true);
     try {
-      await ipc.agentPrompt(text);
+      // In standalone mode the message is the objective for an autonomous goal run; otherwise
+      // it's a single chat turn.
+      await (isStandalone ? ipc.agentRunGoal(text) : ipc.agentPrompt(text));
     } catch (e) {
       pushChat({ kind: "error", text: String(e) });
       setRunning(false);
@@ -47,6 +59,29 @@ export default function AgentChat() {
 
   const cancel = () => {
     ipc.agentCancel().catch(() => {});
+  };
+
+  const toggleStandalone = () => {
+    setStandalone(!isStandalone);
+  };
+
+  const cycleBudget = () => {
+    const idx = BUDGET_PRESETS.indexOf(tokenBudget);
+    const next = BUDGET_PRESETS[(idx + 1) % BUDGET_PRESETS.length] ?? 0;
+    setTokenBudget(next);
+    ipc.agentSetTokenBudget(next).catch(() => {});
+  };
+
+  const [learning, setLearning] = useState(false);
+  const learn = async () => {
+    setLearning(true);
+    try {
+      await ipc.agentDistillProfile();
+    } catch {
+      /* non-fatal */
+    } finally {
+      setLearning(false);
+    }
   };
 
   const toggleAutonomous = () => {
@@ -111,15 +146,34 @@ export default function AgentChat() {
         {isRunning && (
           <span className="flex items-center gap-1 text-[10px] text-ink-faint">
             <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
-            thinking…
+            {isStandalone && goalIteration > 0 ? `autonomous · step ${goalIteration}` : "thinking…"}
           </span>
         )}
         <div className="ml-auto flex items-center gap-1.5">
           {(totalTokens.input + totalTokens.output) > 0 && (
-            <span className="font-mono text-[10px] text-ink-faint" title={`↑${totalTokens.input} ↓${totalTokens.output}`}>
-              {(totalTokens.input + totalTokens.output).toLocaleString()}t
+            <span
+              className={`font-mono text-[10px] ${
+                tokenBudget > 0 && totalTokens.input + totalTokens.output >= tokenBudget
+                  ? "text-danger"
+                  : "text-ink-faint"
+              }`}
+              title={`↑${totalTokens.input} ↓${totalTokens.output}`}
+            >
+              {(totalTokens.input + totalTokens.output).toLocaleString()}
+              {tokenBudget > 0 ? ` / ${fmtBudget(tokenBudget)}` : "t"}
             </span>
           )}
+          <button
+            onClick={cycleBudget}
+            className={`flex h-5 items-center gap-1 rounded border px-1.5 text-[10px] transition-colors ${
+              tokenBudget > 0
+                ? "border-accent/50 bg-accent/10 text-accent"
+                : "border-base-600 text-ink-faint hover:border-base-500 hover:text-ink"
+            }`}
+            title="Cumulative token budget cap — click to cycle. Runs stop when reached."
+          >
+            ⛽ {fmtBudget(tokenBudget)}
+          </button>
           {!isRunning && chat.length > 0 && (
             <button
               onClick={clearChat}
@@ -151,6 +205,28 @@ export default function AgentChat() {
           >
             {isAutonomous ? "⚡ auto" : "⚡ auto"}
           </button>
+          <button
+            onClick={toggleStandalone}
+            disabled={isRunning}
+            className={`flex h-5 items-center gap-1 rounded border px-1.5 text-[10px] transition-colors disabled:opacity-40 ${
+              isStandalone
+                ? "border-accent/60 bg-accent/15 text-accent"
+                : "border-base-600 text-ink-faint hover:border-base-500 hover:text-ink"
+            }`}
+            title={isStandalone
+              ? "Standalone mode ON — your next message is an objective the agent pursues autonomously until done"
+              : "Enable standalone mode (agent iterates toward a goal on its own; auto-approves in-scope commands)"}
+          >
+            🎯 solo
+          </button>
+          <button
+            onClick={() => void learn()}
+            disabled={isRunning || learning}
+            className="flex h-5 items-center gap-1 rounded border border-base-600 px-1.5 text-[10px] text-ink-faint transition-colors hover:border-base-500 hover:text-ink disabled:opacity-40"
+            title="Distill durable habits from recent activity into the agent's profile (runs on the sub-agent model — free if local)"
+          >
+            {learning ? "🧠 …" : "🧠 learn"}
+          </button>
           {isRunning && (
             <button
               onClick={cancel}
@@ -166,7 +242,9 @@ export default function AgentChat() {
       <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
         {chat.length === 0 && (
           <p className="text-[13px] leading-relaxed text-ink-faint">
-            Ask the agent to begin — e.g. "enumerate services on 10.0.0.5".
+            {isStandalone
+              ? 'Standalone mode — describe an objective and the agent pursues it on its own, e.g. "get the user and root flags on 10.0.0.5".'
+              : 'Ask the agent to begin — e.g. "enumerate services on 10.0.0.5".'}
           </p>
         )}
         {chat.map((line, i) => (
@@ -188,7 +266,7 @@ export default function AgentChat() {
               }
             }}
             rows={2}
-            placeholder="Ask the agent, or describe a target…"
+            placeholder={isStandalone ? "Describe the objective to pursue autonomously…" : "Ask the agent, or describe a target…"}
             className="min-h-0 flex-1 resize-none bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-faint"
           />
           <button

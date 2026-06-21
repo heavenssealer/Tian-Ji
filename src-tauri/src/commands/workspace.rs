@@ -103,8 +103,10 @@ pub async fn workspace_create(
         scope_url_domains: vec![],
     };
     let model = state.model();
+    state.reset_token_meter();
     *state.current.lock().unwrap() = Some(Arc::new(CurrentWorkspace::build(
         meta, store, &model, state.autonomous.clone(), state.free_mode.clone(),
+        state.tokens_spent.clone(), state.token_budget.clone(), &state.app,
     )));
     Ok(info)
 }
@@ -129,8 +131,10 @@ pub async fn workspace_open(state: State<'_, AppState>, id: String) -> AppResult
         scope_url_domains: scope.url_domains,
     };
     let model = state.model();
+    state.reset_token_meter();
     *state.current.lock().unwrap() = Some(Arc::new(CurrentWorkspace::build(
         meta, store, &model, state.autonomous.clone(), state.free_mode.clone(),
+        state.tokens_spent.clone(), state.token_budget.clone(), &state.app,
     )));
     Ok(info)
 }

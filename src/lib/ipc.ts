@@ -2,7 +2,7 @@
 // One function per #[tauri::command]; keep names in lockstep with src-tauri/src/commands/.
 
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalResolution, EventDto, FindingDto, Phase, PolicyRuleDto, WorkspaceInfo } from "./types";
+import type { ApprovalResolution, EventDto, FindingDto, Phase, PolicyRuleDto, ProfileFact, ProfileScope, WorkspaceInfo } from "./types";
 
 export const ipc = {
   workspaceList: () => invoke<WorkspaceInfo[]>("workspace_list"),
@@ -22,8 +22,15 @@ export const ipc = {
   terminalClose: (id: string) => invoke<void>("terminal_close", { id }),
 
   agentPrompt: (prompt: string) => invoke<void>("agent_prompt", { prompt }),
+  agentRunGoal: (goal: string) => invoke<void>("agent_run_goal", { goal }),
   agentSetFreeMode: (enabled: boolean) => invoke<void>("agent_set_free_mode", { enabled }),
   agentSetAutonomous: (enabled: boolean) => invoke<void>("agent_set_autonomous", { enabled }),
+  agentSetTokenBudget: (tokens: number) => invoke<void>("agent_set_token_budget", { tokens }),
+  agentDistillProfile: () => invoke<void>("agent_distill_profile"),
+  profileFactsList: () => invoke<ProfileFact[]>("profile_facts_list"),
+  profileFactAdd: (text: string, scope: ProfileScope) => invoke<void>("profile_fact_add", { text, scope }),
+  profileFactRemove: (id: number, scope: ProfileScope) => invoke<void>("profile_fact_remove", { id, scope }),
+  profileFactPin: (id: number, scope: ProfileScope, pinned: boolean) => invoke<void>("profile_fact_pin", { id, scope, pinned }),
   agentCancel: () => invoke<void>("agent_cancel"),
   agentNewSession: (sessionId: string) => invoke<void>("agent_new_session", { sessionId }),
   agentSwitchSession: (sessionId: string) => invoke<void>("agent_switch_session", { sessionId }),

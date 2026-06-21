@@ -9,8 +9,17 @@ use crate::secrets;
 use crate::state::{AppResult, AppState, CurrentWorkspace};
 use tianji_store::WorkspaceStore;
 
-/// Models offered in the UI picker.
-const MODELS: &[&str] = &["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"];
+/// Models offered in the UI picker. `ollama:<name>` entries run locally (free, no API key) via a
+/// running Ollama instance; the listed ones are tool-calling-capable. Pull them first with
+/// `ollama pull <name>`.
+const MODELS: &[&str] = &[
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+    "ollama:llama3.1",
+    "ollama:qwen2.5-coder",
+    "ollama:mistral-nemo",
+];
 
 /// Rebuild the open workspace's orchestrator (after a key or model change).
 fn rebuild_current(state: &AppState) -> AppResult<()> {
@@ -20,6 +29,7 @@ fn rebuild_current(state: &AppState) -> AppResult<()> {
         let model = state.model();
         *state.current.lock().unwrap() = Some(Arc::new(CurrentWorkspace::build(
             meta, store, &model, state.autonomous.clone(), state.free_mode.clone(),
+            state.tokens_spent.clone(), state.token_budget.clone(), &state.app,
         )));
     }
     Ok(())

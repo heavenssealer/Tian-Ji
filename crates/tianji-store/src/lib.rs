@@ -78,6 +78,15 @@ pub struct WorkspaceMeta {
     pub root_path: String,
 }
 
+/// A distilled, always-injected profile fact (an operator habit or an engagement detail). `id`
+/// is the row id within its store; `pinned` facts are kept verbatim and never auto-pruned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileFact {
+    pub id: i64,
+    pub text: String,
+    pub pinned: bool,
+}
+
 /// Global, install-wide store. Holds *which* workspaces exist — nothing engagement-specific.
 pub struct AppStore {
     conn: Mutex<Connection>,
@@ -165,6 +174,25 @@ impl AppStore {
             [enc(rule)?],
         )?;
         Ok(())
+    }
+
+    // ---- global profile facts (the operator's enduring, cross-engagement habits) -----------
+
+    /// Add a global habit. De-duplicates on case-insensitive text; returns the (existing or new) id.
+    pub fn add_global_fact(&self, text: &str) -> Result<i64> {
+        fact_add(&self.conn.lock().unwrap(), "global_facts", text)
+    }
+
+    pub fn global_facts(&self) -> Result<Vec<ProfileFact>> {
+        fact_list(&self.conn.lock().unwrap(), "global_facts")
+    }
+
+    pub fn remove_global_fact(&self, id: i64) -> Result<()> {
+        fact_remove(&self.conn.lock().unwrap(), "global_facts", id)
+    }
+
+    pub fn pin_global_fact(&self, id: i64, pinned: bool) -> Result<()> {
+        fact_set_pinned(&self.conn.lock().unwrap(), "global_facts", id, pinned)
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -323,6 +351,49 @@ impl WorkspaceStore {
             rusqlite::params![payload, id.0.to_string(), enc(&EventKind::Note)?],
         )?;
         Ok(())
+    }
+
+    // ---- conversation persistence --------------------------------------------------------
+
+    /// Persist a session's serialized conversation (a JSON `Vec<Message>`) so it survives app
+    /// restarts and orchestrator rebuilds. Stored in the `meta` kv under `conv:<session_id>`.
+    /// The event log remains the audit source of truth; this is a runtime cache of the projection.
+    pub fn save_conversation(&self, session_id: &str, messages_json: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        set_meta(&conn, &format!("conv:{session_id}"), messages_json)
+    }
+
+    /// Load every persisted conversation as `(session_id, messages_json)` pairs.
+    pub fn load_conversations(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT key, value FROM meta WHERE key LIKE 'conv:%'")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(k, v)| (k.trim_start_matches("conv:").to_string(), v))
+            .collect())
+    }
+
+    // ---- per-workspace profile facts (this engagement's state — never leaves this DB) ------
+
+    pub fn add_workspace_fact(&self, text: &str) -> Result<i64> {
+        fact_add(&self.conn.lock().unwrap(), "workspace_facts", text)
+    }
+
+    pub fn workspace_facts(&self) -> Result<Vec<ProfileFact>> {
+        fact_list(&self.conn.lock().unwrap(), "workspace_facts")
+    }
+
+    pub fn remove_workspace_fact(&self, id: i64) -> Result<()> {
+        fact_remove(&self.conn.lock().unwrap(), "workspace_facts", id)
+    }
+
+    pub fn pin_workspace_fact(&self, id: i64, pinned: bool) -> Result<()> {
+        fact_set_pinned(&self.conn.lock().unwrap(), "workspace_facts", id, pinned)
     }
 
     // ---- read-models & config ------------------------------------------------------------
@@ -496,6 +567,53 @@ fn read_rules(conn: &Connection, table: &str) -> Result<Vec<AllowRule>> {
     rows.iter().map(|s| dec(s)).collect()
 }
 
+// ---- profile-fact helpers, shared by both stores (tables share a shape) --------------------
+// `table` is always a hard-coded constant ("global_facts" / "workspace_facts"), never user input.
+
+fn fact_add(conn: &Connection, table: &str, text: &str) -> Result<i64> {
+    let text = text.trim();
+    let existing: Option<i64> = conn
+        .query_row(
+            &format!("SELECT id FROM {table} WHERE lower(text) = lower(?1) LIMIT 1"),
+            [text],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    conn.execute(
+        &format!("INSERT INTO {table} (text, pinned, created_at) VALUES (?1, 0, ?2)"),
+        (text, fmt_ts(&OffsetDateTime::now_utc())?),
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn fact_list(conn: &Connection, table: &str) -> Result<Vec<ProfileFact>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, text, pinned FROM {table} ORDER BY pinned DESC, id ASC"
+    ))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ProfileFact { id: r.get(0)?, text: r.get(1)?, pinned: r.get::<_, i64>(2)? != 0 })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn fact_remove(conn: &Connection, table: &str, id: i64) -> Result<()> {
+    conn.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [id])?;
+    Ok(())
+}
+
+fn fact_set_pinned(conn: &Connection, table: &str, id: i64, pinned: bool) -> Result<()> {
+    conn.execute(
+        &format!("UPDATE {table} SET pinned = ?1 WHERE id = ?2"),
+        rusqlite::params![pinned as i64, id],
+    )?;
+    Ok(())
+}
+
 fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
@@ -542,6 +660,44 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].id, id);
         assert_eq!(recent[0].payload["text"], "admin form looks custom");
+    }
+
+    #[test]
+    fn profile_facts_crud_dedup_and_pin_ordering() {
+        let app = AppStore::open_in_memory().unwrap();
+        let id = app.add_global_fact("prefers ffuf").unwrap();
+        // Case-insensitive dedup returns the same row, not a duplicate.
+        assert_eq!(app.add_global_fact("Prefers ffuf").unwrap(), id);
+        app.add_global_fact("checks robots.txt early").unwrap();
+
+        // Pinned facts sort first.
+        app.pin_global_fact(app.global_facts().unwrap()[1].id, true).unwrap();
+        let facts = app.global_facts().unwrap();
+        assert_eq!(facts.len(), 2);
+        assert!(facts[0].pinned);
+
+        app.remove_global_fact(id).unwrap();
+        assert_eq!(app.global_facts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn global_and_workspace_facts_are_separate_stores() {
+        let app = AppStore::open_in_memory().unwrap();
+        let store = WorkspaceStore::open_in_memory().unwrap();
+        app.add_global_fact("operator habit").unwrap();
+        store.add_workspace_fact("port 8080 runs Tomcat").unwrap();
+
+        // The engagement detail must not appear in the cross-engagement global store.
+        assert!(app.global_facts().unwrap().iter().all(|f| !f.text.contains("Tomcat")));
+        assert_eq!(store.workspace_facts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn conversation_blob_roundtrips() {
+        let store = WorkspaceStore::open_in_memory().unwrap();
+        store.save_conversation("default", "[{\"role\":\"user\"}]").unwrap();
+        let convs = store.load_conversations().unwrap();
+        assert_eq!(convs, vec![("default".to_string(), "[{\"role\":\"user\"}]".to_string())]);
     }
 
     #[test]

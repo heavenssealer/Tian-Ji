@@ -4,11 +4,11 @@
 //! (DESIGN.md §9.6).
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tianji_agent::Orchestrator;
-use tianji_llm::ClaudeProvider;
+use tianji_llm::{ClaudeProvider, LlmProvider, OllamaProvider};
 use tianji_pty::PtyManager;
 use tianji_store::{AppStore, WorkspaceMeta, WorkspaceStore};
 
@@ -61,10 +61,21 @@ pub struct AppState {
     /// workspace switches and can be set before any workspace is opened.
     pub autonomous: Arc<AtomicBool>,
     pub free_mode: Arc<AtomicBool>,
+    /// Cost meter + budget cap, also kept here so they survive workspace switches. `token_budget`
+    /// of 0 = unlimited.
+    pub tokens_spent: Arc<AtomicU64>,
+    pub token_budget: Arc<AtomicU64>,
 }
 
 impl AppState {
     pub fn new(app: AppStore, workspaces_root: PathBuf) -> Self {
+        // Restore a persisted budget so a cap survives restarts.
+        let budget = app
+            .get_setting("token_budget")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         Self {
             app,
             workspaces_root,
@@ -72,6 +83,8 @@ impl AppState {
             current: Mutex::new(None),
             autonomous: Arc::new(AtomicBool::new(false)),
             free_mode: Arc::new(AtomicBool::new(false)),
+            tokens_spent: Arc::new(AtomicU64::new(0)),
+            token_budget: Arc::new(AtomicU64::new(budget)),
         }
     }
 
@@ -80,7 +93,8 @@ impl AppState {
         self.current.lock().unwrap().clone().ok_or(AppError::NoWorkspace)
     }
 
-    /// The selected Claude model (persisted in app settings; defaults to Opus).
+    /// The selected model id (persisted in app settings; defaults to Opus). A `ollama:<name>`
+    /// value selects the local backend.
     pub fn model(&self) -> String {
         self.app
             .get_setting("model")
@@ -88,15 +102,32 @@ impl AppState {
             .flatten()
             .unwrap_or_else(|| "claude-opus-4-8".to_string())
     }
+
+    /// Zero the cost meter — called when opening a different engagement so spend (and the budget
+    /// cap that depends on it) is per-workspace, not cumulative across clients.
+    pub fn reset_token_meter(&self) {
+        self.tokens_spent.store(0, Ordering::SeqCst);
+    }
 }
 
 /// Model to use for delegated sub-agents: never Opus. If the operator picked Opus for the
 /// orchestrator, sub-agents drop to Sonnet; any other (already cheaper) choice is kept as-is.
+/// Local (`ollama:`) models contain no "opus", so they pass through unchanged — already free.
 fn subagent_model_for(model: &str) -> String {
     if model.contains("opus") {
         "claude-sonnet-4-6".to_string()
     } else {
         model.to_string()
+    }
+}
+
+/// Build the right provider for a model id. A `ollama:<name>` prefix selects the local Ollama
+/// backend (free, no API key); anything else is a cloud Claude model.
+fn build_provider(model: &str, api_key: String) -> Arc<dyn LlmProvider> {
+    if let Some(local) = model.strip_prefix("ollama:") {
+        Arc::new(OllamaProvider::new(local.trim()))
+    } else {
+        Arc::new(ClaudeProvider::new(api_key).with_model(model))
     }
 }
 
@@ -108,35 +139,49 @@ pub struct CurrentWorkspace {
 }
 
 impl CurrentWorkspace {
-    /// Assemble the bundle, wiring the Claude provider with the keychain-stored API key and the
-    /// selected model (absent key is allowed — the provider errors only when a turn runs).
-    /// `autonomous` and `free_mode` are owned by `AppState` so they survive workspace switches.
+    /// Assemble the bundle, wiring the LLM provider (Claude or local Ollama) with the
+    /// keychain-stored API key and the selected model (absent key is allowed — the provider errors
+    /// only when a turn runs). The mode flags and cost meter are owned by `AppState` so they
+    /// survive workspace switches.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         meta: WorkspaceMeta,
         store: WorkspaceStore,
         model: &str,
         autonomous: Arc<AtomicBool>,
         free_mode: Arc<AtomicBool>,
+        tokens_spent: Arc<AtomicU64>,
+        token_budget: Arc<AtomicU64>,
+        app: &AppStore,
     ) -> Self {
         let key = crate::secrets::get_api_key("anthropic").ok().flatten().unwrap_or_default();
         let sudo_pw = crate::secrets::get_api_key("sudo").ok().flatten();
-        let provider = ClaudeProvider::new(key.clone()).with_model(model);
+        let provider = build_provider(model, key.clone());
 
-        // Sub-agents do focused grunt work — never run them on Opus. Cap them at Sonnet (if the
-        // operator already picked a non-Opus model, reuse it). This is a big cost lever: an
-        // engagement can spawn many sub-agent rounds.
-        let subagent_provider = ClaudeProvider::new(key).with_model(subagent_model_for(model));
+        // Sub-agents do focused grunt work — never run them on Opus. Cap them at Sonnet (or reuse
+        // an already-cheaper / local model). A big cost lever: engagements spawn many sub-rounds.
+        let subagent_provider = build_provider(&subagent_model_for(model), key);
 
         // One cancellation flag shared by the orchestrator AND the command runner, so Stop
         // interrupts an in-flight tool (not just the round loop between tools).
         let cancel = Arc::new(AtomicBool::new(false));
         let runner = tianji_agent::ProcessRunner::with_sudo_password(sudo_pw)
             .with_cancel(cancel.clone());
-        let orchestrator = Orchestrator::new(Arc::new(provider))
-            .with_subagent_provider(Arc::new(subagent_provider))
+        let orchestrator = Orchestrator::new(provider)
+            .with_subagent_provider(subagent_provider)
             .with_runner(Arc::new(runner))
             .with_cancel(cancel)
+            .with_budget(tokens_spent, token_budget)
             .with_flags(autonomous, free_mode);
+        // Restore prior conversations so the agent doesn't start from scratch after a restart,
+        // workspace switch, or model/key change (all of which rebuild this bundle).
+        orchestrator.hydrate(&store);
+        // Load the operator's distilled global habits so they're injected from message one.
+        let global_facts = app
+            .global_facts()
+            .map(|v| v.into_iter().map(|f| f.text).collect())
+            .unwrap_or_default();
+        orchestrator.set_global_facts(global_facts);
         Self { meta, store, orchestrator }
     }
 }

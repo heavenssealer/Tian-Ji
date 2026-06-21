@@ -10,7 +10,7 @@
 //! is reserved (the `actor`/`parent_id` fields already exist).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -29,6 +29,7 @@ mod approval;
 mod assembler;
 mod mcp;
 mod runner;
+mod summary;
 
 pub use approval::{ApprovalGate, ApprovalOutcome, ApprovalToken, ProposedCall};
 pub use assembler::ContextAssembler;
@@ -42,6 +43,43 @@ const MAX_SUBAGENT_ROUNDS: usize = 5;
 /// Default and maximum token budgets for a single delegation.
 const DEFAULT_SUBAGENT_BUDGET: u32 = 4_000;
 const MAX_SUBAGENT_BUDGET: u32 = 8_000;
+
+/// Standalone (autonomous goal) mode safety rails: how many orchestrator prompt-cycles the goal
+/// loop may run, and the cumulative token ceiling across them, before it stops on its own.
+const MAX_GOAL_ITERATIONS: usize = 15;
+const MAX_GOAL_TOKENS: u64 = 600_000;
+/// How many times the agent may issue the exact same command within one prompt-cycle before the
+/// loop guard refuses to run it again (it's spinning — the repeat won't help).
+const LOOP_LIMIT: usize = 3;
+/// How many recent events the profile distiller reviews, and the minimum needed to bother.
+const DISTILL_EVENT_SCAN: usize = 60;
+const DISTILL_MIN_EVENTS: usize = 4;
+/// Sentinels the model emits to end the goal loop. Kept distinctive so they don't appear by
+/// accident in ordinary prose.
+const GOAL_DONE_TOKEN: &str = "[[GOAL_COMPLETE]]";
+const GOAL_STUCK_TOKEN: &str = "[[GOAL_BLOCKED]]";
+
+/// How a standalone goal run ended. The label is surfaced to the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoalOutcome {
+    Completed,
+    Blocked,
+    MaxIterations,
+    BudgetExhausted,
+    Cancelled,
+}
+
+impl GoalOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            GoalOutcome::Completed => "completed",
+            GoalOutcome::Blocked => "blocked",
+            GoalOutcome::MaxIterations => "max-iterations",
+            GoalOutcome::BudgetExhausted => "budget-exhausted",
+            GoalOutcome::Cancelled => "cancelled",
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -69,6 +107,12 @@ pub enum AgentUpdate {
     SubAgentText { name: String, text: String },
     /// A sub-agent completed and produced a summary.
     SubAgentFinished { name: String, summary: String },
+    /// A standalone (autonomous goal) run began.
+    GoalStarted { goal: String },
+    /// The goal loop advanced to its Nth self-directed iteration.
+    GoalIteration { iteration: u32 },
+    /// The goal loop ended; `outcome` is a [`GoalOutcome`] label.
+    GoalFinished { outcome: String, iterations: u32 },
     TurnEnded,
     Error(String),
 }
@@ -92,6 +136,15 @@ pub struct Orchestrator {
     free_mode: Arc<AtomicBool>,
     /// Set to true by `cancel()`; checked between rounds and stream events.
     cancelled: Arc<AtomicBool>,
+    /// True while a standalone goal run is in progress. Like `autonomous`, it auto-approves
+    /// NeedsApproval tools (a goal loop must not stall on an approval dialog), but it is internal
+    /// and transient so it never clobbers the operator's persisted autonomous setting.
+    goal_active: Arc<AtomicBool>,
+    /// Cumulative input+output tokens spent on this workspace (the cost meter).
+    tokens_spent: Arc<AtomicU64>,
+    /// Hard cap on cumulative tokens; 0 means unlimited. When `tokens_spent` reaches it, runs stop
+    /// before starting another model round.
+    token_budget: Arc<AtomicU64>,
     /// Per-session conversation history. Key = session id, value = past messages.
     histories: std::sync::Mutex<HashMap<String, Vec<Message>>>,
     /// The currently-active session id.
@@ -99,6 +152,10 @@ pub struct Orchestrator {
     /// Dedup cache for read-only commands: key = session+tool+argv, value = prior output. Stops
     /// the model from burning tokens re-running identical scans (DESIGN.md §efficiency).
     command_cache: std::sync::Mutex<HashMap<String, String>>,
+    /// The operator's distilled global habits (cross-engagement), loaded from the app store and
+    /// always injected into the system prompt. Per-workspace facts are read from the store per
+    /// turn; these aren't in the workspace DB, so the orchestrator caches them here.
+    global_facts: std::sync::Mutex<Vec<String>>,
 }
 
 impl Orchestrator {
@@ -115,10 +172,20 @@ impl Orchestrator {
             autonomous: Arc::new(AtomicBool::new(false)),
             free_mode: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            goal_active: Arc::new(AtomicBool::new(false)),
+            tokens_spent: Arc::new(AtomicU64::new(0)),
+            token_budget: Arc::new(AtomicU64::new(0)),
             histories: std::sync::Mutex::new(histories),
             active_session: std::sync::Mutex::new("default".to_string()),
             command_cache: std::sync::Mutex::new(HashMap::new()),
+            global_facts: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Replace the cached global habits (called at build time from the app store and after each
+    /// distillation pass).
+    pub fn set_global_facts(&self, facts: Vec<String>) {
+        *self.global_facts.lock().unwrap() = facts;
     }
 
     /// Run a tool through the runner, deduping identical read-only commands within a session.
@@ -158,6 +225,30 @@ impl Orchestrator {
     pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
         self.cancelled = cancel;
         self
+    }
+
+    /// Share the cost meter (spent) and budget cap with externally-owned atoms so they survive
+    /// workspace switches and the operator can read/set them from the UI. `budget` of 0 = no cap.
+    pub fn with_budget(mut self, spent: Arc<AtomicU64>, budget: Arc<AtomicU64>) -> Self {
+        self.tokens_spent = spent;
+        self.token_budget = budget;
+        self
+    }
+
+    /// Cumulative tokens spent on this workspace so far.
+    pub fn tokens_spent(&self) -> u64 {
+        self.tokens_spent.load(Ordering::SeqCst)
+    }
+
+    /// Set the cumulative token budget (0 = unlimited).
+    pub fn set_token_budget(&self, budget: u64) {
+        self.token_budget.store(budget, Ordering::SeqCst);
+    }
+
+    /// True once a non-zero budget has been reached or exceeded.
+    fn budget_exhausted(&self) -> bool {
+        let cap = self.token_budget.load(Ordering::SeqCst);
+        cap > 0 && self.tokens_spent.load(Ordering::SeqCst) >= cap
     }
 
     /// Replace the internal autonomous/free_mode atoms with externally-owned ones so the caller
@@ -211,6 +302,35 @@ impl Orchestrator {
         *self.active_session.lock().unwrap() = session_id.to_string();
     }
 
+    /// Restore persisted conversations from the workspace store so history survives app restarts
+    /// and orchestrator rebuilds. Called once when a workspace is opened. Malformed blobs are
+    /// skipped rather than failing the open.
+    pub fn hydrate(&self, store: &WorkspaceStore) {
+        let Ok(convs) = store.load_conversations() else { return };
+        let mut histories = self.histories.lock().unwrap();
+        for (session_id, json) in convs {
+            if let Ok(msgs) = serde_json::from_str::<Vec<Message>>(&json) {
+                histories.insert(session_id, msgs);
+            }
+        }
+    }
+
+    /// Number of stored messages for a session (excludes the per-turn system prompt). Mainly for
+    /// tests and diagnostics.
+    pub fn history_len(&self, session_id: &str) -> usize {
+        self.histories.lock().unwrap().get(session_id).map_or(0, |h| h.len())
+    }
+
+    /// The always-injected profile for a turn: the operator's global habits followed by this
+    /// engagement's per-workspace facts.
+    fn profile_for(&self, store: &WorkspaceStore) -> Vec<String> {
+        let mut facts = self.global_facts.lock().unwrap().clone();
+        if let Ok(ws) = store.workspace_facts() {
+            facts.extend(ws.into_iter().map(|f| f.text));
+        }
+        facts
+    }
+
     /// Drive one prompt to completion. Long-running; the caller spawns it as a task.
     /// Accumulates conversation history across calls so the model remembers previous results.
     pub async fn handle_prompt(
@@ -220,7 +340,152 @@ impl Orchestrator {
         prompt: &str,
     ) -> Result<()> {
         self.cancelled.store(false, Ordering::SeqCst);
+        self.run_prompt_inner(store, updates, prompt).await
+    }
 
+    /// Standalone (autonomous goal) mode: drive the agent toward `goal` across multiple
+    /// self-directed prompt-cycles until it signals completion, gets stuck, or hits a safety rail
+    /// (iteration cap, cumulative token budget, or operator Stop). Auto-approval is forced on for
+    /// the duration so the loop never blocks on an approval dialog; scope and explicit-deny policy
+    /// still apply, so it cannot act outside the engagement.
+    pub async fn run_goal(
+        &self,
+        store: &WorkspaceStore,
+        updates: UnboundedSender<AgentUpdate>,
+        goal: &str,
+    ) -> Result<()> {
+        self.cancelled.store(false, Ordering::SeqCst);
+        self.goal_active.store(true, Ordering::SeqCst);
+        let _ = updates.send(AgentUpdate::GoalStarted { goal: goal.to_string() });
+
+        let mut iteration: usize = 0;
+        let mut total_tokens: u64 = 0;
+        let mut prompt = goal_prompt(goal, true);
+
+        let outcome = loop {
+            if self.cancelled.load(Ordering::SeqCst) {
+                break GoalOutcome::Cancelled;
+            }
+            if iteration >= MAX_GOAL_ITERATIONS {
+                break GoalOutcome::MaxIterations;
+            }
+            if total_tokens >= MAX_GOAL_TOKENS {
+                break GoalOutcome::BudgetExhausted;
+            }
+            iteration += 1;
+            let _ = updates.send(AgentUpdate::GoalIteration { iteration: iteration as u32 });
+
+            // Tee this cycle's updates to the UI, but (a) swallow the per-cycle TurnEnded so the
+            // UI stays "running" across the whole loop, and (b) sniff the assistant text for the
+            // completion sentinel and sum token usage for the budget rail.
+            let (tee_tx, mut tee_rx) = tokio::sync::mpsc::unbounded_channel::<AgentUpdate>();
+            let fwd = updates.clone();
+            let watcher = tokio::spawn(async move {
+                let mut text = String::new();
+                let mut toks: u64 = 0;
+                while let Some(u) = tee_rx.recv().await {
+                    match &u {
+                        AgentUpdate::Text(t) => text.push_str(t),
+                        AgentUpdate::TokensUsed { input, output } => {
+                            toks += *input as u64 + *output as u64;
+                        }
+                        AgentUpdate::TurnEnded => continue,
+                        _ => {}
+                    }
+                    let _ = fwd.send(u);
+                }
+                (text, toks)
+            });
+
+            let res = self.run_prompt_inner(store, tee_tx, &prompt).await;
+            let (text, toks) = watcher.await.unwrap_or_default();
+            total_tokens += toks;
+
+            if let Err(e) = res {
+                // Unwind cleanly: clear the flag and close out the run before propagating.
+                self.goal_active.store(false, Ordering::SeqCst);
+                let _ = updates.send(AgentUpdate::GoalFinished {
+                    outcome: "error".to_string(),
+                    iterations: iteration as u32,
+                });
+                let _ = updates.send(AgentUpdate::TurnEnded);
+                return Err(e);
+            }
+
+            if text.contains(GOAL_DONE_TOKEN) {
+                break GoalOutcome::Completed;
+            }
+            if text.contains(GOAL_STUCK_TOKEN) {
+                break GoalOutcome::Blocked;
+            }
+            prompt = goal_prompt(goal, false);
+        };
+
+        self.goal_active.store(false, Ordering::SeqCst);
+        let _ = updates.send(AgentUpdate::GoalFinished {
+            outcome: outcome.label().to_string(),
+            iterations: iteration as u32,
+        });
+        let _ = updates.send(AgentUpdate::TurnEnded);
+        Ok(())
+    }
+
+    /// Distill durable profile facts from recent activity (DESIGN §6.2 — "learn the operator").
+    /// Runs on the cheaper sub-agent provider (free if it's local), writes per-workspace facts to
+    /// the store, and RETURNS the global (cross-engagement) facts for the caller to persist in the
+    /// app store. Global facts are scrubbed of engagement specifics by the prompt — they describe
+    /// the operator's habits, never a target.
+    pub async fn distill_profile(&self, store: &WorkspaceStore) -> Vec<String> {
+        let events = store.recent_events(DISTILL_EVENT_SCAN).unwrap_or_default();
+        if events.len() < DISTILL_MIN_EVENTS {
+            return Vec::new();
+        }
+
+        let messages = vec![
+            Message { role: Role::System, content: vec![text(DISTILL_SYSTEM.to_string())] },
+            Message {
+                role: Role::User,
+                content: vec![text(format!("Recent activity:\n{}", distill_transcript(&events)))],
+            },
+        ];
+        let trimmed = ContextAssembler::default().trim_to_budget(&messages);
+        let Ok(mut stream) = self.subagent_provider.run_turn(&trimmed, &[]).await else {
+            return Vec::new();
+        };
+
+        let mut out = String::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::TextDelta { text } => out.push_str(&text),
+                AgentEvent::TokensUsed { input_tokens, output_tokens } => {
+                    self.tokens_spent
+                        .fetch_add(input_tokens as u64 + output_tokens as u64, Ordering::SeqCst);
+                }
+                AgentEvent::TurnEnd => break,
+                _ => {}
+            }
+        }
+
+        let mut global = Vec::new();
+        for (scope, fact) in parse_distilled_facts(&out) {
+            if scope == "global" {
+                global.push(fact);
+            } else {
+                let _ = store.add_workspace_fact(&fact);
+            }
+        }
+        global
+    }
+
+    /// One prompt-cycle: build context → run tool-rounds → persist. Unlike [`handle_prompt`] this
+    /// does NOT reset the cancel flag, so the standalone goal loop can keep a Stop latched across
+    /// iterations (otherwise each new cycle would clear it and ignore the operator's Stop).
+    async fn run_prompt_inner(
+        &self,
+        store: &WorkspaceStore,
+        updates: UnboundedSender<AgentUpdate>,
+        prompt: &str,
+    ) -> Result<()> {
         let ws = store.workspace_id();
         let scope = store.scope()?;
         let rules = store.allow_rules()?;
@@ -245,16 +510,27 @@ impl Orchestrator {
             history_before_len = history.len();
             // System prompt is rebuilt fresh each turn (scope/phase/notes may have changed).
             let mut msgs = vec![
-                Message { role: Role::System, content: vec![text(system_prompt(phase, &scope, &notes, self.free_mode.load(Ordering::SeqCst)))] },
+                Message { role: Role::System, content: vec![text(system_prompt(phase, &scope, &notes, self.free_mode.load(Ordering::SeqCst), &self.profile_for(store)))] },
             ];
             msgs.extend(history.clone());
             msgs
         };
         messages.push(Message { role: Role::User, content: vec![text(prompt.to_string())] });
 
+        // Repeated-command counts for this prompt-cycle, feeding the loop guard.
+        let mut loop_counts: HashMap<String, usize> = HashMap::new();
+
         let assembler = ContextAssembler::default();
         for _round in 0..MAX_ROUNDS {
             if self.cancelled.load(Ordering::SeqCst) {
+                break;
+            }
+            if self.budget_exhausted() {
+                let cap = self.token_budget.load(Ordering::SeqCst);
+                let _ = updates.send(AgentUpdate::Error(format!(
+                    "Token budget reached ({} / {cap}). Stopping. Raise or clear the budget to continue.",
+                    self.tokens_spent()
+                )));
                 break;
             }
 
@@ -282,6 +558,10 @@ impl Orchestrator {
                         tool_calls.push(call);
                     }
                     AgentEvent::TokensUsed { input_tokens, output_tokens } => {
+                        self.tokens_spent.fetch_add(
+                            input_tokens as u64 + output_tokens as u64,
+                            Ordering::SeqCst,
+                        );
                         let _ = updates.send(AgentUpdate::TokensUsed {
                             input: input_tokens,
                             output: output_tokens,
@@ -315,15 +595,40 @@ impl Orchestrator {
                 if self.cancelled.load(Ordering::SeqCst) {
                     break;
                 }
-                let output = if call.name == "record_finding" {
+                let context_output = if call.name == "record_finding" {
                     self.handle_record_finding(store, &updates, ws, phase, &call)?
                 } else if call.name == "delegate_to_agent" {
                     self.run_subagent(store, &updates, ws, phase, &call).await?
                 } else {
-                    self.handle_tool_call(store, &updates, ws, phase, &scope, &rules, &call)
-                        .await?
+                    let (tool, argv) = parse_run_command(&call);
+                    // Loop guard: if the agent keeps re-issuing the exact same command this cycle,
+                    // refuse to run it again and tell it to change approach.
+                    let sig = format!("{tool}\u{1}{}", argv.join("\u{1}"));
+                    let hits = {
+                        let c = loop_counts.entry(sig).or_insert(0);
+                        *c += 1;
+                        *c
+                    };
+                    let raw = if hits > LOOP_LIMIT {
+                        let reason = format!(
+                            "loop guard: `{tool} {}` was already issued {hits}× this turn",
+                            argv.join(" ")
+                        );
+                        let _ = updates.send(AgentUpdate::Denied { reason });
+                        format!(
+                            "LOOP GUARD: you have run `{tool} {}` {hits} times this turn with no new \
+                             result. Not running it again — change approach or conclude.",
+                            argv.join(" ")
+                        )
+                    } else {
+                        self.handle_tool_call(store, &updates, ws, phase, &scope, &rules, &call)
+                            .await?
+                    };
+                    // Summarize large command output before it enters the conversation history; the
+                    // full raw output is already persisted in the event log and streamed to the UI.
+                    summary::summarize_tool_output(&tool, &raw)
                 };
-                results.push(Content::ToolResult { call_id: call.call_id, output });
+                results.push(Content::ToolResult { call_id: call.call_id, output: context_output });
             }
             if !results.is_empty() {
                 messages.push(Message { role: Role::Tool, content: results });
@@ -336,7 +641,12 @@ impl Orchestrator {
             let new_entries = messages[(1 + history_before_len)..].to_vec();
             if !new_entries.is_empty() {
                 let mut histories = self.histories.lock().unwrap();
-                histories.entry(session_id).or_default().extend(new_entries);
+                let h = histories.entry(session_id.clone()).or_default();
+                h.extend(new_entries);
+                // Cache the conversation to the workspace DB so it survives restarts/rebuilds.
+                if let Ok(json) = serde_json::to_string(&*h) {
+                    let _ = store.save_conversation(&session_id, &json);
+                }
             }
         }
 
@@ -393,7 +703,10 @@ impl Orchestrator {
 
         let sys = format!(
             "{}{recalled_hint}",
-            system_prompt(subagent_phase, &scope, &notes, self.free_mode.load(Ordering::SeqCst))
+            system_prompt(
+                subagent_phase, &scope, &notes,
+                self.free_mode.load(Ordering::SeqCst), &self.profile_for(store),
+            )
         );
 
         let mut messages = vec![
@@ -441,6 +754,7 @@ impl Orchestrator {
                     AgentEvent::TokensUsed { input_tokens, output_tokens } => {
                         let used = input_tokens + output_tokens;
                         tokens_used = tokens_used.saturating_add(used);
+                        self.tokens_spent.fetch_add(used as u64, Ordering::SeqCst);
                         let _ = updates.send(AgentUpdate::TokensUsed {
                             input: input_tokens,
                             output: output_tokens,
@@ -530,7 +844,7 @@ impl Orchestrator {
                             format!("DENIED (policy): {reason}")
                         }
                         Decision::NeedsApproval => {
-                            if self.autonomous.load(Ordering::SeqCst) {
+                            if self.autonomous.load(Ordering::SeqCst) || self.goal_active.load(Ordering::SeqCst) {
                                 let _ = updates.send(AgentUpdate::ToolStarted { tool: tool.clone(), argv: argv.clone() });
                                 let output = self.run_cached(&tool, &argv);
                                 let _ = updates.send(AgentUpdate::ToolOutput { text: output.clone() });
@@ -573,7 +887,15 @@ impl Orchestrator {
                         } } // close free_mode else + match
                     }
                 };
-                results.push(Content::ToolResult { call_id: tc.call_id, output: out });
+                // Summarize large command output before it enters the sub-agent's context (raw
+                // output is already in the event log). Finding/denial strings are already compact.
+                let context_out = if tc.name == "record_finding" {
+                    out
+                } else {
+                    let (tool, _) = parse_run_command(&tc);
+                    summary::summarize_tool_output(&tool, &out)
+                };
+                results.push(Content::ToolResult { call_id: tc.call_id, output: context_out });
             }
             if !results.is_empty() {
                 messages.push(Message { role: Role::Tool, content: results });
@@ -638,7 +960,7 @@ impl Orchestrator {
                 format!("DENIED (policy): {reason}")
             }
             Decision::NeedsApproval => {
-                if self.autonomous.load(Ordering::SeqCst) {
+                if self.autonomous.load(Ordering::SeqCst) || self.goal_active.load(Ordering::SeqCst) {
                     // Autonomous mode: skip the approval gate, execute directly.
                     self.execute(store, updates, ws, phase, &tool, &argv)?
                 } else {
@@ -830,11 +1152,98 @@ fn needs_shell(tool: &str, argv: &[String]) -> bool {
     })
 }
 
+const DISTILL_SYSTEM: &str = "You maintain a durable profile of a penetration tester you assist. \
+From the recent activity, extract a SHORT list of durable facts worth remembering long-term. \
+Classify each:\n\
+- \"global\": an enduring habit or preference of THIS OPERATOR to apply on EVERY future \
+engagement (preferred tools, methodology, conventions, wordlists, reporting style). It MUST NOT \
+contain target-specific data — no IPs, hostnames, credentials, or client names.\n\
+- \"workspace\": a detail specific to THIS engagement worth remembering (open services, \
+footholds, target quirks, credentials found).\n\
+Only include genuinely durable, useful facts; skip transient noise and anything already obvious. \
+Output ONLY a JSON array, e.g. \
+[{\"scope\":\"global\",\"text\":\"...\"},{\"scope\":\"workspace\",\"text\":\"...\"}]. \
+If nothing is worth saving, output [].";
+
+/// Render recent events (newest-first) into a compact chronological transcript for distillation.
+fn distill_transcript(events: &[tianji_types::Event]) -> String {
+    let mut lines = Vec::new();
+    for e in events.iter().rev() {
+        if let Some(t) = distill_event_text(e) {
+            let snippet: String = t.chars().take(200).collect();
+            lines.push(format!("[{:?}] {snippet}", e.kind));
+        }
+    }
+    let mut s = lines.join("\n");
+    s.truncate(s.char_indices().nth(6000).map_or(s.len(), |(i, _)| i));
+    s
+}
+
+fn distill_event_text(e: &tianji_types::Event) -> Option<String> {
+    e.payload
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .or_else(|| e.payload.get("text").and_then(|v| v.as_str()))
+        .or_else(|| e.payload.get("output").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+}
+
+/// Parse the model's JSON array of `{scope, text}` facts. Tolerant: extracts the array even if the
+/// model wrapped it in prose, and defaults an unknown scope to "workspace" (the safe, isolated one).
+fn parse_distilled_facts(text: &str) -> Vec<(String, String)> {
+    let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) else {
+        return Vec::new();
+    };
+    if end < start {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text[start..=end]) else {
+        return Vec::new();
+    };
+    let Some(arr) = value.as_array() else { return Vec::new() };
+    arr.iter()
+        .filter_map(|item| {
+            let fact = item.get("text").and_then(|x| x.as_str()).unwrap_or("").trim();
+            if fact.is_empty() {
+                return None;
+            }
+            let scope = item.get("scope").and_then(|x| x.as_str()).unwrap_or("workspace");
+            let scope = if scope.eq_ignore_ascii_case("global") { "global" } else { "workspace" };
+            Some((scope.to_string(), fact.to_string()))
+        })
+        .collect()
+}
+
+/// The instruction injected at the top of each standalone goal cycle. `first` distinguishes the
+/// opening objective from the lighter continuation nudge sent on later iterations.
+fn goal_prompt(goal: &str, first: bool) -> String {
+    if first {
+        format!(
+            "AUTONOMOUS GOAL MODE. You are operating WITHOUT a human in the loop. Objective:\n\
+             {goal}\n\n\
+             Work toward this objective end to end — enumerate, hypothesise, exploit, and verify — \
+             using tools and sub-agents as needed. Record each concrete result with record_finding \
+             as you go. Do NOT ask the operator questions; decide and act. \
+             When the objective is FULLY achieved, send a final message whose LAST line is exactly \
+             `{GOAL_DONE_TOKEN}`. If you exhaust every avenue and genuinely cannot proceed, send a \
+             final message whose LAST line is exactly `{GOAL_STUCK_TOKEN}` followed by the reason."
+        )
+    } else {
+        format!(
+            "Continue autonomously toward the objective. Build on what you already learned — do \
+             NOT repeat completed scans. If the objective is now fully achieved, end your message \
+             with `{GOAL_DONE_TOKEN}` on its own last line; if you are truly blocked, end with \
+             `{GOAL_STUCK_TOKEN}` and the reason."
+        )
+    }
+}
+
 fn system_prompt(
     phase: Phase,
     scope: &ScopeRules,
     notes: &[tianji_types::Event],
     free_mode: bool,
+    profile: &[String],
 ) -> String {
     let phase_hint = match phase {
         Phase::Recon => "You are in the RECON phase: enumerate hosts/services with read-only tools.",
@@ -863,6 +1272,18 @@ fn system_prompt(
             .collect::<Vec<_>>()
             .join("\n");
         format!(" Operator notebook:\n{lines}")
+    };
+
+    // Distilled profile — the operator's habits + what we know about this engagement. Always
+    // injected so the agent applies it proactively from the first message.
+    let profile_hint = if profile.is_empty() {
+        String::new()
+    } else {
+        let lines = profile.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
+        format!(
+            " What you've learned about this operator and engagement (apply it proactively, but \
+             the operator's explicit instructions always win):\n{lines}"
+        )
     };
 
     // Tell the model the operator OS so it picks the right command syntax.
@@ -906,7 +1327,7 @@ fn system_prompt(
 
     format!(
         "You are an assistant to an authorized penetration tester. \
-         {scope_hint}{notes_hint} \
+         {scope_hint}{notes_hint}{profile_hint} \
          Use the run_command tool to run system tools. \
          When you discover an open port, vulnerable service, misconfiguration, or any \
          noteworthy security issue, call record_finding immediately with severity \
@@ -974,21 +1395,21 @@ mod tests {
 
     #[test]
     fn open_mode_lets_the_agent_install_tools() {
-        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], true);
+        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], true, &[]);
         assert!(p.contains("OPEN MODE"));
         assert!(p.to_lowercase().contains("install it yourself"));
     }
 
     #[test]
     fn controlled_mode_forbids_install_and_advises_operator() {
-        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false);
+        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[]);
         assert!(p.contains("CONTROLLED MODE"));
         assert!(p.contains("must NOT install"));
     }
 
     #[test]
     fn prompt_makes_delegation_the_default() {
-        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false);
+        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[]);
         assert!(p.contains("delegate_to_agent"));
         assert!(p.contains("DEFAULT for separable work"));
     }
@@ -1090,5 +1511,167 @@ mod tests {
 
         assert_eq!(runner.calls.lock().unwrap().len(), 0, "out-of-scope must not run");
         assert!(drain(rx).iter().any(|u| matches!(u, AgentUpdate::Denied { .. })));
+    }
+
+    #[test]
+    fn goal_prompt_carries_sentinels() {
+        let first = goal_prompt("retrieve user and root flags", true);
+        assert!(first.contains("retrieve user and root flags"));
+        assert!(first.contains(GOAL_DONE_TOKEN));
+        assert!(first.contains(GOAL_STUCK_TOKEN));
+        let cont = goal_prompt("retrieve user and root flags", false);
+        assert!(cont.contains(GOAL_DONE_TOKEN));
+        assert!(cont.contains(GOAL_STUCK_TOKEN));
+    }
+
+    #[tokio::test]
+    async fn run_goal_completes_on_sentinel() {
+        let store = store_with_scope("10.0.0.0/24");
+        let orch = Orchestrator::new(Arc::new(ScriptedProvider::new(vec![vec![
+            AgentEvent::TextDelta { text: format!("flag captured {GOAL_DONE_TOKEN}") },
+            AgentEvent::TurnEnd,
+        ]])));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        orch.run_goal(&store, tx, "capture the user flag").await.unwrap();
+
+        let u = drain(rx);
+        assert!(u.iter().any(|x| matches!(x, AgentUpdate::GoalStarted { .. })));
+        assert!(u.iter().any(|x| matches!(
+            x,
+            AgentUpdate::GoalFinished { outcome, iterations }
+                if outcome == "completed" && *iterations == 1
+        )));
+        // The per-cycle TurnEnded is swallowed; exactly one final TurnEnded reaches the UI.
+        assert_eq!(
+            u.iter().filter(|x| matches!(x, AgentUpdate::TurnEnded)).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn run_goal_stops_at_iteration_cap() {
+        let store = store_with_scope("10.0.0.0/24");
+        // Provider never emits the sentinel (always an empty round) → the loop must terminate on
+        // the iteration safety rail rather than spinning forever.
+        let orch = Orchestrator::new(Arc::new(ScriptedProvider::new(vec![])));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        orch.run_goal(&store, tx, "an unreachable objective").await.unwrap();
+
+        assert!(drain(rx).iter().any(|x| matches!(
+            x,
+            AgentUpdate::GoalFinished { outcome, iterations }
+                if outcome == "max-iterations" && *iterations == MAX_GOAL_ITERATIONS as u32
+        )));
+    }
+
+    #[test]
+    fn profile_facts_are_injected() {
+        let p = system_prompt(
+            Phase::Recon,
+            &ScopeRules::default(),
+            &[],
+            false,
+            &["prefers ffuf over gobuster".to_string()],
+        );
+        assert!(p.contains("prefers ffuf over gobuster"));
+        assert!(p.contains("learned about this operator"));
+    }
+
+    #[tokio::test]
+    async fn distillation_extracts_and_routes_facts() {
+        let store = store_with_scope("10.0.0.0/24");
+        for i in 0..6 {
+            store
+                .append(Event::new(
+                    store.workspace_id(),
+                    Phase::Recon,
+                    EventKind::AgentMsg,
+                    AgentId("agent".into()),
+                    Author::Agent,
+                    json!({ "text": format!("did thing {i}") }),
+                ))
+                .unwrap();
+        }
+        let facts_json = r#"[{"scope":"global","text":"prefers ffuf over gobuster"},
+                             {"scope":"workspace","text":"port 8080 runs Tomcat"}]"#;
+        let orch = Orchestrator::new(Arc::new(ScriptedProvider::new(vec![vec![
+            AgentEvent::TextDelta { text: facts_json.to_string() },
+            AgentEvent::TurnEnd,
+        ]])));
+
+        let global = orch.distill_profile(&store).await;
+        assert_eq!(global, vec!["prefers ffuf over gobuster"]);
+        let ws = store.workspace_facts().unwrap();
+        assert!(ws.iter().any(|f| f.text.contains("Tomcat")));
+        // Global facts must never carry per-engagement specifics into the workspace store.
+        assert!(!ws.iter().any(|f| f.text.contains("ffuf")));
+    }
+
+    #[tokio::test]
+    async fn conversation_persists_and_hydrates() {
+        let store = store_with_scope("10.0.0.0/24");
+        let orch = Orchestrator::new(Arc::new(ScriptedProvider::new(vec![vec![
+            AgentEvent::TextDelta { text: "hello".into() },
+            AgentEvent::TurnEnd,
+        ]])))
+        .with_runner(Arc::new(StubRunner::default()));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        orch.handle_prompt(&store, tx, "hi there").await.unwrap();
+        let saved_len = orch.history_len("default");
+        assert!(saved_len > 0, "the turn should have populated history");
+
+        // A fresh orchestrator (simulating a restart/rebuild) starts empty, then hydrates.
+        let orch2 = Orchestrator::new(Arc::new(ScriptedProvider::new(vec![])));
+        assert_eq!(orch2.history_len("default"), 0);
+        orch2.hydrate(&store);
+        assert_eq!(orch2.history_len("default"), saved_len, "history should be restored");
+    }
+
+    #[tokio::test]
+    async fn loop_guard_stops_repeated_command() {
+        let store = store_with_scope("10.0.0.0/24");
+        let runner = Arc::new(StubRunner::default());
+        // The model insists on the same (in-scope, auto-running) command every round.
+        let rounds = (0..6)
+            .map(|_| vec![run_command_call("ping", &["10.0.0.5"]), AgentEvent::TurnEnd])
+            .collect();
+        let orch = Orchestrator::new(Arc::new(ScriptedProvider::new(rounds)))
+            .with_runner(runner.clone());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        orch.handle_prompt(&store, tx, "hit it").await.unwrap();
+
+        assert!(drain(rx).iter().any(|x| matches!(
+            x,
+            AgentUpdate::Denied { reason } if reason.contains("loop guard")
+        )));
+    }
+
+    #[tokio::test]
+    async fn token_budget_halts_the_run() {
+        let store = store_with_scope("10.0.0.0/24");
+        let runner = Arc::new(StubRunner::default());
+        let orch = Orchestrator::new(Arc::new(ScriptedProvider::new(vec![
+            vec![
+                AgentEvent::TokensUsed { input_tokens: 500, output_tokens: 500 },
+                run_command_call("ping", &["10.0.0.5"]),
+                AgentEvent::TurnEnd,
+            ],
+            vec![AgentEvent::TextDelta { text: "again".into() }, AgentEvent::TurnEnd],
+        ])))
+        .with_runner(runner.clone());
+        orch.set_token_budget(100); // tiny — the first round blows past it
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        orch.handle_prompt(&store, tx, "go").await.unwrap();
+
+        assert!(orch.tokens_spent() >= 1000);
+        assert!(drain(rx).iter().any(|x| matches!(
+            x,
+            AgentUpdate::Error(m) if m.contains("Token budget reached")
+        )));
     }
 }

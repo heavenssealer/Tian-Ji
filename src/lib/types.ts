@@ -32,7 +32,8 @@ export type ApprovalResolution =
 
 export interface AgentDelta {
   type: "text_delta" | "tool_call" | "tool_output" | "turn_end" | "error" | "denied" | "finding" | "token_usage"
-      | "subagent_start" | "subagent_text" | "subagent_end";
+      | "subagent_start" | "subagent_text" | "subagent_end"
+      | "goal_start" | "goal_iteration" | "goal_end";
   text?: string;
   input?: number;
   output?: number;
@@ -68,6 +69,15 @@ export interface PolicyRuleDto {
 export interface ChatSession {
   id: string;
   name: string;
+}
+
+export type ProfileScope = "global" | "workspace";
+
+export interface ProfileFact {
+  id: number;
+  text: string;
+  pinned: boolean;
+  scope: ProfileScope;
 }
 
 export type Severity = "critical" | "high" | "medium" | "low" | "info";

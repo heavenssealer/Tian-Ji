@@ -30,6 +30,10 @@ pub fn init_app_db(conn: &Connection) -> Result<(), StoreError> {
         conn.execute_batch(APP_V1)?;
         set_user_version(conn, 1)?;
     }
+    if user_version(conn)? < 2 {
+        conn.execute_batch(APP_V2)?;
+        set_user_version(conn, 2)?;
+    }
     Ok(())
 }
 
@@ -40,8 +44,33 @@ pub fn init_workspace_db(conn: &Connection) -> Result<(), StoreError> {
         conn.execute_batch(WORKSPACE_V1)?;
         set_user_version(conn, 1)?;
     }
+    if user_version(conn)? < 2 {
+        conn.execute_batch(WORKSPACE_V2)?;
+        set_user_version(conn, 2)?;
+    }
     Ok(())
 }
+
+/// v2: profile facts — distilled, always-injected habits. Global facts (the operator's enduring
+/// habits, cross-engagement) live in the app DB; per-workspace facts (this engagement's state)
+/// live in the workspace DB and never leak between engagements.
+const APP_V2: &str = "
+CREATE TABLE global_facts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    text       TEXT NOT NULL,
+    pinned     INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+";
+
+const WORKSPACE_V2: &str = "
+CREATE TABLE workspace_facts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    text       TEXT NOT NULL,
+    pinned     INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+";
 
 const APP_V1: &str = "
 CREATE TABLE workspaces (

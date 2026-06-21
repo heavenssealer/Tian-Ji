@@ -11,7 +11,9 @@ use futures::stream::BoxStream;
 use tianji_types::{AgentEvent, Message, ToolSpec};
 
 mod claude;
+mod ollama;
 pub use claude::ClaudeProvider;
+pub use ollama::OllamaProvider;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {

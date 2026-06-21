@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../../lib/ipc";
 import { onNotesUpdated } from "../../lib/events";
-import type { EventDto, FindingDto, Phase } from "../../lib/types";
+import type { EventDto, FindingDto, Phase, ProfileFact, ProfileScope } from "../../lib/types";
 import { useAppStore } from "../../state/stores";
 import NotesEditorModal from "./NotesEditorModal";
 import ReportModal from "./ReportModal";
@@ -17,10 +17,14 @@ const SEV_STYLE: Record<string, string> = {
 };
 
 export default function NotesPanel() {
-  const [tab, setTab] = useState<"auto" | "notebook" | "findings">("auto");
+  const [tab, setTab] = useState<"auto" | "notebook" | "findings" | "profile">("auto");
   const [draft, setDraft] = useState("");
   const [events, setEvents] = useState<EventDto[]>([]);
   const [findings, setFindings] = useState<FindingDto[]>([]);
+  const [facts, setFacts] = useState<ProfileFact[]>([]);
+  const [factDraft, setFactDraft] = useState("");
+  const [factScope, setFactScope] = useState<ProfileScope>("global");
+  const [distilling, setDistilling] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
   const [phaseFilter, setPhaseFilter] = useState<Phase | null>(null);
@@ -30,11 +34,18 @@ export default function NotesPanel() {
 
   const loadEvents = () => ipc.eventsQuery(100).then(setEvents).catch(() => setEvents([]));
   const loadFindings = () => ipc.findingsQuery().then(setFindings).catch(() => setFindings([]));
-  const load = () => { void loadEvents(); void loadFindings(); };
+  const loadFacts = () => ipc.profileFactsList().then(setFacts).catch(() => setFacts([]));
+  const load = () => { void loadEvents(); void loadFindings(); void loadFacts(); };
 
   useEffect(() => {
     setPhaseFilter(null);
   }, [currentId]);
+
+  // Global facts exist even with no workspace open, and should refresh when this tab is shown
+  // (e.g. after an auto-distill following a standalone run).
+  useEffect(() => {
+    void loadFacts();
+  }, [currentId, tab]);
 
   useEffect(() => {
     setEvents([]);
@@ -68,6 +79,28 @@ export default function NotesPanel() {
     try { await ipc.notesAdd(text); await loadEvents(); } catch { /* no workspace */ }
   };
 
+  const globalFacts = facts.filter((f) => f.scope === "global");
+  const workspaceFacts = facts.filter((f) => f.scope === "workspace");
+
+  const addFact = async () => {
+    const text = factDraft.trim();
+    if (!text) return;
+    setFactDraft("");
+    try { await ipc.profileFactAdd(text, factScope); await loadFacts(); } catch { /* ignore */ }
+  };
+  const removeFact = async (f: ProfileFact) => {
+    await ipc.profileFactRemove(f.id, f.scope).catch(() => {});
+    await loadFacts();
+  };
+  const togglePin = async (f: ProfileFact) => {
+    await ipc.profileFactPin(f.id, f.scope, !f.pinned).catch(() => {});
+    await loadFacts();
+  };
+  const distill = async () => {
+    setDistilling(true);
+    try { await ipc.agentDistillProfile(); await loadFacts(); } catch { /* ignore */ } finally { setDistilling(false); }
+  };
+
   return (
     <div className="flex h-full flex-col bg-base-700 text-xs">
       <div className="flex h-9 shrink-0 items-center gap-1 border-b border-base-500 px-2">
@@ -82,6 +115,14 @@ export default function NotesPanel() {
           {findings.length > 0 && (
             <span className="ml-1 inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-danger/80 px-0.5 text-[9px] font-bold leading-none text-base-900">
               {findings.length}
+            </span>
+          )}
+        </Tab>
+        <Tab active={tab === "profile"} onClick={() => setTab("profile")}>
+          Profile
+          {facts.length > 0 && (
+            <span className="ml-1 inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-accent/80 px-0.5 text-[9px] font-bold leading-none text-base-900">
+              {facts.length}
             </span>
           )}
         </Tab>
@@ -199,6 +240,65 @@ export default function NotesPanel() {
         </ul>
       )}
 
+      {tab === "profile" && (
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <div className="flex shrink-0 items-center gap-2 border-b border-base-500 px-2 py-1.5">
+            <span className="text-[10px] text-ink-faint">
+              What the agent has learned. Global facts follow you across engagements.
+            </span>
+            <button
+              onClick={() => void distill()}
+              disabled={distilling}
+              className="ml-auto shrink-0 rounded border border-base-500 px-1.5 py-0.5 text-[10px] text-ink-faint hover:bg-base-600 hover:text-ink disabled:opacity-40"
+              title="Distill durable facts from recent activity"
+            >
+              {distilling ? "🧠 …" : "🧠 learn now"}
+            </button>
+          </div>
+
+          <div className="min-h-0 flex-1 overflow-auto p-2">
+            <FactGroup
+              label="Operator habits (global)"
+              empty="no global habits learned yet"
+              facts={globalFacts}
+              onPin={togglePin}
+              onRemove={removeFact}
+            />
+            <FactGroup
+              label="This engagement"
+              empty="nothing learned about this engagement yet"
+              facts={workspaceFacts}
+              onPin={togglePin}
+              onRemove={removeFact}
+            />
+          </div>
+
+          <div className="flex shrink-0 items-center gap-1 border-t border-base-500 p-2">
+            <select
+              value={factScope}
+              onChange={(e) => setFactScope(e.target.value as ProfileScope)}
+              className="shrink-0 rounded bg-base-800 px-1 py-1 text-[10px] text-ink-dim ring-1 ring-base-500 outline-none"
+            >
+              <option value="global">global</option>
+              <option value="workspace">engagement</option>
+            </select>
+            <input
+              value={factDraft}
+              onChange={(e) => setFactDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void addFact(); } }}
+              placeholder="Add a fact the agent should remember…"
+              className="min-w-0 flex-1 rounded bg-base-800 px-2 py-1 text-[11px] text-ink outline-none ring-1 ring-base-500 focus:ring-accent/50"
+            />
+            <button
+              onClick={() => void addFact()}
+              className="shrink-0 rounded px-2 py-1 text-[10px] text-ink-dim ring-1 ring-base-500 hover:bg-base-600"
+            >
+              Add
+            </button>
+          </div>
+        </div>
+      )}
+
       {editorOpen && (
         <NotesEditorModal events={events} onClose={() => setEditorOpen(false)} onChanged={loadEvents} />
       )}
@@ -215,6 +315,56 @@ export default function NotesPanel() {
 
 function truncate(s: string): string {
   return s.length > 120 ? s.slice(0, 120) + "…" : s;
+}
+
+function FactGroup({
+  label,
+  empty,
+  facts,
+  onPin,
+  onRemove,
+}: {
+  label: string;
+  empty: string;
+  facts: ProfileFact[];
+  onPin: (f: ProfileFact) => void;
+  onRemove: (f: ProfileFact) => void;
+}) {
+  return (
+    <div className="mb-3">
+      <div className="mb-1 font-mono text-[9px] uppercase tracking-wide text-ink-faint">{label}</div>
+      {facts.length === 0 ? (
+        <p className="text-[11px] text-ink-faint">{empty}</p>
+      ) : (
+        <ul className="space-y-1">
+          {facts.map((f) => (
+            <li
+              key={`${f.scope}-${f.id}`}
+              className="group flex items-start gap-1.5 rounded border border-base-500 bg-base-800 px-2 py-1.5"
+            >
+              <button
+                onClick={() => onPin(f)}
+                className={`mt-0.5 shrink-0 ${
+                  f.pinned ? "text-warn" : "text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink"
+                }`}
+                title={f.pinned ? "Unpin" : "Pin (protect from cleanup)"}
+              >
+                {f.pinned ? "★" : "☆"}
+              </button>
+              <span className="min-w-0 flex-1 text-[11px] leading-relaxed text-ink-dim">{f.text}</span>
+              <button
+                onClick={() => onRemove(f)}
+                className="mt-0.5 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 hover:text-danger"
+                title="Delete"
+              >
+                ✕
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 function Tab({
