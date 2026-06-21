@@ -25,8 +25,6 @@ anyhow = "1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# keyring 3.x needs an explicit per-platform backend feature.
-keyring = { version = "3" }
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
