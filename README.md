@@ -44,6 +44,7 @@ sudo apt-get install -y \
   libayatana-appindicator3-dev \
   librsvg2-dev \
   libdbus-1-dev \
+  libglib2.0-dev \
   libgtk-3-dev
 ```
 
