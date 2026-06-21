@@ -1,0 +1,214 @@
+import { create } from "zustand";
+import type { ActiveAgent, AgentDelta, ChatSession, Phase, ProposedCall, WorkspaceInfo } from "../lib/types";
+
+export interface ChatLine {
+  kind: "user" | "agent" | "tool" | "error" | "finding";
+  text: string;
+}
+
+export interface TokenCount { input: number; output: number }
+
+const DEFAULT_SESSION: ChatSession = { id: "default", name: "Chat 1" };
+
+interface AppUiState {
+  workspaces: WorkspaceInfo[];
+  currentWorkspaceId: string | null;
+  phase: Phase;
+  // Session management
+  sessions: ChatSession[];
+  currentSessionId: string;
+  sessionLines: Record<string, ChatLine[]>;
+  // chat = current session's lines (kept in sync for backward compat)
+  chat: ChatLine[];
+  pendingApproval: ProposedCall | null;
+  isRunning: boolean;
+  isAutonomous: boolean;
+  isFreeMode: boolean;
+  totalTokens: TokenCount;
+  activeAgents: ActiveAgent[];
+
+  setWorkspaces: (w: WorkspaceInfo[]) => void;
+  setCurrentWorkspace: (id: string | null) => void;
+  setPhase: (p: Phase) => void;
+  // Session actions
+  newSession: () => ChatSession;
+  switchSession: (id: string) => void;
+  // Chat actions (operate on current session)
+  setChat: (lines: ChatLine[]) => void;
+  pushChat: (line: ChatLine) => void;
+  applyDelta: (d: AgentDelta) => void;
+  setPendingApproval: (c: ProposedCall | null) => void;
+  setRunning: (v: boolean) => void;
+  setAutonomous: (v: boolean) => void;
+  setFreeMode: (v: boolean) => void;
+}
+
+let sessionCounter = 1;
+
+export const useAppStore = create<AppUiState>((set, get) => ({
+  workspaces: [],
+  currentWorkspaceId: null,
+  phase: "recon",
+  sessions: [DEFAULT_SESSION],
+  currentSessionId: DEFAULT_SESSION.id,
+  sessionLines: { [DEFAULT_SESSION.id]: [] },
+  chat: [],
+  pendingApproval: null,
+  isRunning: false,
+  isAutonomous: false,
+  isFreeMode: false,
+  totalTokens: { input: 0, output: 0 },
+  activeAgents: [{ name: "orchestrator", status: "idle" }],
+
+  setWorkspaces: (workspaces) => set({ workspaces }),
+
+  setCurrentWorkspace: (currentWorkspaceId) => {
+    const session = DEFAULT_SESSION;
+    set({
+      currentWorkspaceId,
+      sessions: [session],
+      currentSessionId: session.id,
+      sessionLines: { [session.id]: [] },
+      chat: [],
+      isRunning: false,
+      isAutonomous: false,
+      isFreeMode: false,
+      totalTokens: { input: 0, output: 0 },
+      activeAgents: [{ name: "orchestrator", status: "idle" }],
+    });
+    sessionCounter = 1;
+  },
+
+  setPhase: (phase) => set({ phase }),
+
+  newSession: () => {
+    sessionCounter += 1;
+    const session: ChatSession = { id: `session-${Date.now()}`, name: `Chat ${sessionCounter}` };
+    set((s) => ({
+      sessions: [...s.sessions, session],
+      currentSessionId: session.id,
+      sessionLines: { ...s.sessionLines, [session.id]: [] },
+      chat: [],
+      isRunning: false,
+    }));
+    return session;
+  },
+
+  switchSession: (id: string) => {
+    const lines = get().sessionLines[id] ?? [];
+    set({ currentSessionId: id, chat: lines, isRunning: false });
+  },
+
+  setChat: (lines) =>
+    set((s) => ({
+      chat: lines,
+      sessionLines: { ...s.sessionLines, [s.currentSessionId]: lines },
+    })),
+
+  pushChat: (line) =>
+    set((s) => {
+      const updated = [...s.chat, line];
+      return {
+        chat: updated,
+        sessionLines: { ...s.sessionLines, [s.currentSessionId]: updated },
+      };
+    }),
+
+  setRunning: (isRunning) =>
+    set((s) => ({
+      isRunning,
+      activeAgents: s.activeAgents.map((a) =>
+        a.name === "orchestrator" ? { ...a, status: isRunning ? "running" : "idle" } : a
+      ),
+    })),
+
+  applyDelta: (d) =>
+    set((s) => {
+      const updateChat = (newChat: ChatLine[]) => ({
+        chat: newChat,
+        sessionLines: { ...s.sessionLines, [s.currentSessionId]: newChat },
+      });
+
+      switch (d.type) {
+        case "text_delta": {
+          const last = s.chat[s.chat.length - 1];
+          if (last?.kind === "agent") {
+            const updated = [...s.chat];
+            updated[updated.length - 1] = { kind: "agent", text: last.text + (d.text ?? "") };
+            return updateChat(updated);
+          }
+          return updateChat([...s.chat, { kind: "agent", text: d.text ?? "" }]);
+        }
+        case "tool_call":
+          return updateChat([...s.chat, { kind: "tool", text: `$ ${d.text ?? ""}` }]);
+        case "tool_output":
+          return updateChat([...s.chat, { kind: "tool", text: d.text ?? "" }]);
+        case "denied":
+          return updateChat([...s.chat, { kind: "error", text: `⊘ Denied: ${d.text ?? ""}` }]);
+        case "finding":
+          return updateChat([...s.chat, { kind: "finding", text: d.text ?? "" }]);
+        case "error":
+          return updateChat([...s.chat, { kind: "error", text: d.text ?? "" }]);
+        case "token_usage":
+          return {
+            totalTokens: {
+              input: s.totalTokens.input + (d.input ?? 0),
+              output: s.totalTokens.output + (d.output ?? 0),
+            },
+          };
+        case "subagent_start": {
+          const newAgent: ActiveAgent = {
+            name: d.agentName ?? "agent",
+            status: "running",
+            objective: d.objective,
+          };
+          const newChat = [...s.chat, {
+            kind: "agent" as const,
+            text: `▷ **[${d.agentName ?? "agent"} agent]** ${d.objective ?? ""}`,
+          }];
+          return {
+            activeAgents: [...s.activeAgents.filter((a) => a.name !== newAgent.name), newAgent],
+            ...updateChat(newChat),
+          };
+        }
+        case "subagent_text": {
+          const label = `[${d.agentName ?? "agent"}]`;
+          const last = s.chat[s.chat.length - 1];
+          if (last?.kind === "agent" && last.text.startsWith(`▷ **${label}`)) {
+            // First text chunk after the header — start a new line
+          }
+          // Accumulate into a sub-agent bubble identified by its prefix
+          const marker = `[sub:${d.agentName ?? ""}]`;
+          const lastSub = s.chat.length > 0 ? s.chat[s.chat.length - 1] : null;
+          if (lastSub?.kind === "agent" && lastSub.text.startsWith(marker)) {
+            const updated = [...s.chat];
+            updated[updated.length - 1] = {
+              kind: "agent",
+              text: marker + lastSub.text.slice(marker.length) + (d.text ?? ""),
+            };
+            return updateChat(updated);
+          }
+          return updateChat([...s.chat, { kind: "agent", text: marker + (d.text ?? "") }]);
+        }
+        case "subagent_end": {
+          return {
+            activeAgents: s.activeAgents.map((a) =>
+              a.name === (d.agentName ?? "") ? { ...a, status: "done" } : a
+            ),
+          };
+        }
+        case "turn_end":
+          return {
+            isRunning: false,
+            activeAgents: s.activeAgents.map((a) => ({ ...a, status: "idle" as const })),
+          };
+        default:
+          return {};
+      }
+    }),
+
+  setPendingApproval: (pendingApproval) => set({ pendingApproval }),
+
+  setAutonomous: (isAutonomous) => set({ isAutonomous }),
+  setFreeMode: (isFreeMode) => set({ isFreeMode }),
+}));

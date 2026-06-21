@@ -1,0 +1,18 @@
+[package]
+name = "tianji-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The ONLY crate allowed to know about a specific provider's wire format. Anthropic/OpenAI
+# specifics stay sealed in here behind the LlmProvider trait.
+[dependencies]
+tianji-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }

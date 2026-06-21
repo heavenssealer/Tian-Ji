@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    @apply bg-base-900 text-ink font-sans text-sm antialiased;
+  }
+
+  /* Thin, dark scrollbars to match the wazuh aesthetic. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #2a2a2e transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: #2a2a2e;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: #3a3a40;
+    background-clip: padding-box;
+  }
+}
+
+@layer components {
+  /* Uppercase letter-spaced section label (wazuh style). */
+  .label {
+    @apply font-mono text-[10px] uppercase tracking-[0.14em] text-ink-faint;
+  }
+  /* Bordered surface card. */
+  .panel {
+    @apply rounded-card border border-base-500 bg-base-700;
+  }
+  /* Small pill button. */
+  .pill {
+    @apply rounded-md px-2.5 py-1 text-[11px] text-ink-dim transition-colors hover:bg-base-600;
+  }
+  .pill-active {
+    @apply bg-accent/15 text-accent ring-1 ring-accent/40;
+  }
+}

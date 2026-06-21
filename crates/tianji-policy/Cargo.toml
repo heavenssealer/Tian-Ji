@@ -1,0 +1,13 @@
+[package]
+name = "tianji-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# NOTE: intentionally NO async, NO I/O, NO db, NO network deps. This crate is pure logic so the
+# safety guarantees can be exhaustively unit-tested. Keep it that way.
+[dependencies]
+tianji-types = { workspace = true }
+serde        = { workspace = true }
+thiserror    = { workspace = true }
+ipnet        = { workspace = true }

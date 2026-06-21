@@ -1,0 +1,33 @@
+[package]
+name = "tianji"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tiān Jī — LLM-orchestrated pentesting framework"
+default-run = "tianji"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tianji-types = { workspace = true }
+tianji-policy = { workspace = true }
+tianji-store = { workspace = true }
+tianji-pty = { workspace = true }
+tianji-llm = { workspace = true }
+tianji-agent = { workspace = true }
+
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = "1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# keyring 3.x needs an explicit backend feature, else it uses a no-op store that never persists.
+keyring = { version = "3", features = ["windows-native"] }
+
+[features]
+# Tauri custom-protocol for production builds.
+custom-protocol = ["tauri/custom-protocol"]

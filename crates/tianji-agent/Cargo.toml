@@ -1,0 +1,19 @@
+[package]
+name = "tianji-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tianji-types = { workspace = true }
+tianji-policy = { workspace = true }
+tianji-store = { workspace = true }
+tianji-pty = { workspace = true }
+tianji-llm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

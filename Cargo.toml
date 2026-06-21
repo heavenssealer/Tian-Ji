@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tianji-types",
+    "crates/tianji-policy",
+    "crates/tianji-store",
+    "crates/tianji-pty",
+    "crates/tianji-llm",
+    "crates/tianji-agent",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.77"
+
+# Centralized versions so every crate stays in lockstep.
+[workspace.dependencies]
+tianji-types  = { path = "crates/tianji-types" }
+tianji-policy = { path = "crates/tianji-policy" }
+tianji-store  = { path = "crates/tianji-store" }
+tianji-pty    = { path = "crates/tianji-pty" }
+tianji-llm    = { path = "crates/tianji-llm" }
+tianji-agent  = { path = "crates/tianji-agent" }
+
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+uuid        = { version = "1", features = ["v4", "serde"] }
+time        = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+thiserror   = "2"
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1"
+futures     = "0.3"
+tracing     = "0.1"
+rusqlite    = { version = "0.32", features = ["bundled"] }
+portable-pty = "0.8"
+ipnet        = "2"
+reqwest     = { version = "0.12", features = ["json", "stream"] }
+ts-rs       = "10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,52 @@
+# Rust build artefacts — but NOT Cargo.lock (binary app → lock file is committed for
+# reproducible builds; see https://doc.rust-lang.org/cargo/faq.html#why-do-binaries-have-cargolock-in-version-control)
+**/target/
+
+# Node / Vite frontend
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Tauri generated files (Android/iOS project stubs, not relevant for desktop-only)
+src-tauri/gen/
+
+# ── Engagement data — NEVER commit ──────────────────────────────────────────
+# SQLite workspace databases and WAL/SHM side-files
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Local workspace directories written by the app at runtime
+/workspaces/
+
+# ── Secrets — NEVER commit ───────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ── Tool artefacts that must never land in the repo ─────────────────────────
+# nmap / tool output files saved outside the workspace store
+*.xml
+*.nmap
+*.gnmap
+*_scan.txt
+full_scan.txt
+
+# ── OS / editor noise ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
+
+# ── Claude Code local settings ───────────────────────────────────────────────
+.claude/
