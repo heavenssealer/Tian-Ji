@@ -20,8 +20,10 @@ const PHASE_OPTIONS: { value: Phase; label: string }[] = [
   { value: "report", label: "report" },
 ];
 
-const RIGHT_MIN = 320;
-const RIGHT_MAX = 760;
+// Min width is sized so the agent toolbar (token meter + budget + clear + free/auto/solo/learn)
+// always fits on a single row without wrapping or clipping.
+const RIGHT_MIN = 460;
+const RIGHT_MAX = 820;
 const NOTES_MIN = 120;
 const NOTES_MAX_MARGIN = 220; // keep at least this much for the terminal above
 
@@ -42,7 +44,7 @@ export default function AppShell() {
     void ipc.workspaceSetPhase(p).catch(() => {});
   };
 
-  const [rightWidth, setRightWidth] = useState(420);
+  const [rightWidth, setRightWidth] = useState(480);
   const drag = useRef<{ startX: number; startW: number } | null>(null);
 
   // Notes panel lives at the bottom of the center column; its height is drag-resizable.

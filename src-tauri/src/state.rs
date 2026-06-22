@@ -132,6 +132,9 @@ pub const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
 pub const DEFAULT_OLLAMA_NUM_CTX: u32 = 16_384;
 /// Smallest context window we'll accept — below this the agent's own prompt won't fit.
 pub const MIN_OLLAMA_NUM_CTX: u32 = 4_096;
+/// At or below this window, switch the orchestrator into small-context mode (terse prompt, harder
+/// caps, no delegation) so a tiny local model stays usable.
+pub const SMALL_CONTEXT_THRESHOLD: u32 = 8_192;
 
 /// The configured Ollama host (persisted in app settings), normalized without a trailing slash.
 pub fn ollama_host(app: &AppStore) -> String {
@@ -221,6 +224,10 @@ impl CurrentWorkspace {
             16_000
         };
 
+        // Small-context mode — a tiny local window (≤ 8k) can't fit the full prompt + a useful
+        // conversation, so switch the orchestrator to its terse, hard-bounded, no-delegation variant.
+        let small_context = model.starts_with("ollama:") && num_ctx <= SMALL_CONTEXT_THRESHOLD;
+
         // One cancellation flag shared by the orchestrator AND the command runner, so Stop
         // interrupts an in-flight tool (not just the round loop between tools).
         let cancel = Arc::new(AtomicBool::new(false));
@@ -232,6 +239,7 @@ impl CurrentWorkspace {
             .with_cancel(cancel)
             .with_budget(tokens_spent, token_budget)
             .with_context_budget(context_budget)
+            .with_small_context(small_context)
             .with_flags(autonomous, free_mode);
         // Restore prior conversations so the agent doesn't start from scratch after a restart,
         // workspace switch, or model/key change (all of which rebuild this bundle).

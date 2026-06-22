@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ipc } from "../../lib/ipc";
@@ -13,7 +13,6 @@ const fmtBudget = (n: number) =>
   n === 0 ? "off" : n >= 1_000_000 ? `${n / 1_000_000}M` : `${n / 1000}k`;
 
 export default function AgentChat() {
-  const [prompt, setPrompt] = useState("");
   const chat = useAppStore((s) => s.chat);
   const pending = useAppStore((s) => s.pendingApproval);
   const isRunning = useAppStore((s) => s.isRunning);
@@ -41,21 +40,23 @@ export default function AgentChat() {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chat.length, pending]);
 
-  const send = async () => {
-    const text = prompt.trim();
-    if (!text || isRunning) return;
-    pushChat({ kind: "user", text });
-    setPrompt("");
-    setRunning(true);
-    try {
-      // In standalone mode the message is the objective for an autonomous goal run; otherwise
-      // it's a single chat turn.
-      await (isStandalone ? ipc.agentRunGoal(text) : ipc.agentPrompt(text));
-    } catch (e) {
-      pushChat({ kind: "error", text: String(e) });
-      setRunning(false);
-    }
-  };
+  // Stable across renders so the memoized <Composer> below doesn't re-render while the user types
+  // (the textarea's own state is local — typing never touches AgentChat or the message list).
+  const send = useCallback(
+    async (text: string) => {
+      pushChat({ kind: "user", text });
+      setRunning(true);
+      try {
+        // In standalone mode the message is the objective for an autonomous goal run; otherwise
+        // it's a single chat turn.
+        await (isStandalone ? ipc.agentRunGoal(text) : ipc.agentPrompt(text));
+      } catch (e) {
+        pushChat({ kind: "error", text: String(e) });
+        setRunning(false);
+      }
+    },
+    [isStandalone, pushChat, setRunning]
+  );
 
   const cancel = () => {
     ipc.agentCancel().catch(() => {});
@@ -140,24 +141,24 @@ export default function AgentChat() {
         </button>
       </div>
 
-      {/* Toolbar — wraps to a second row at narrow widths instead of clipping. */}
-      <div className="flex min-h-9 shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-base-500 px-3 py-1">
-        <span className="label">Agent</span>
+      {/* Toolbar — single row; the panel min-width guarantees it fits, with horizontal scroll as a
+          last-resort safety net so controls never wrap or clip. */}
+      <div className="flex h-9 shrink-0 items-center gap-2 overflow-x-auto border-b border-base-500 px-3">
         {isRunning && (
-          <span className="flex items-center gap-1 text-[10px] text-ink-faint">
+          <span className="flex shrink-0 items-center gap-1 text-[10px] text-ink-faint">
             <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
             {isStandalone && goalIteration > 0 ? `autonomous · step ${goalIteration}` : "thinking…"}
           </span>
         )}
-        <div className="ml-auto flex flex-wrap items-center justify-end gap-1.5">
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
           {(totalTokens.input + totalTokens.output) > 0 && (
             <span
-              className={`font-mono text-[10px] ${
+              className={`shrink-0 font-mono text-[10px] tabular-nums ${
                 tokenBudget > 0 && totalTokens.input + totalTokens.output >= tokenBudget
                   ? "text-danger"
                   : "text-ink-faint"
               }`}
-              title={`↑${totalTokens.input} ↓${totalTokens.output}`}
+              title={`Cumulative this session · ↑${totalTokens.input} in ↓${totalTokens.output} out`}
             >
               {(totalTokens.input + totalTokens.output).toLocaleString()}
               {tokenBudget > 0 ? ` / ${fmtBudget(tokenBudget)}` : "t"}
@@ -254,37 +255,63 @@ export default function AgentChat() {
         <div ref={endRef} />
       </div>
 
-      <div className="border-t border-base-500 p-2.5">
-        <div className="flex items-end gap-2 rounded-card border border-base-500 bg-base-800 p-2 focus-within:border-accent/40">
-          <textarea
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                void send();
-              }
-            }}
-            rows={2}
-            placeholder={isStandalone ? "Describe the objective to pursue autonomously…" : "Ask the agent, or describe a target…"}
-            className="min-h-0 flex-1 resize-none bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-faint"
-          />
-          <button
-            onClick={() => void send()}
-            disabled={isRunning}
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent text-base-900 transition-opacity hover:opacity-90 disabled:opacity-40"
-            title="Send (Enter)"
-          >
-            ↑
-          </button>
-        </div>
-        <div className="mt-1.5 px-1 text-right text-[10px] text-ink-faint">
-          Enter to send · Shift+Enter for newline
-        </div>
-      </div>
+      <Composer isRunning={isRunning} isStandalone={isStandalone} onSend={send} />
     </div>
   );
 }
+
+// Isolated composer with its OWN text state. Keeping the prompt here (instead of in AgentChat)
+// means each keystroke re-renders only this small component — not the growing, markdown-heavy
+// message list. That's what fixes the input getting laggier as the conversation grows.
+const Composer = memo(function Composer({
+  isRunning,
+  isStandalone,
+  onSend,
+}: {
+  isRunning: boolean;
+  isStandalone: boolean;
+  onSend: (text: string) => void;
+}) {
+  const [prompt, setPrompt] = useState("");
+
+  const submit = () => {
+    const text = prompt.trim();
+    if (!text || isRunning) return;
+    setPrompt("");
+    onSend(text);
+  };
+
+  return (
+    <div className="border-t border-base-500 p-2.5">
+      <div className="flex items-end gap-2 rounded-card border border-base-500 bg-base-800 p-2 focus-within:border-accent/40">
+        <textarea
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+          rows={2}
+          placeholder={isStandalone ? "Describe the objective to pursue autonomously…" : "Ask the agent, or describe a target…"}
+          className="min-h-0 flex-1 resize-none bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-faint"
+        />
+        <button
+          onClick={submit}
+          disabled={isRunning}
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent text-base-900 transition-opacity hover:opacity-90 disabled:opacity-40"
+          title="Send (Enter)"
+        >
+          ↑
+        </button>
+      </div>
+      <div className="mt-1.5 px-1 text-right text-[10px] text-ink-faint">
+        Enter to send · Shift+Enter for newline
+      </div>
+    </div>
+  );
+});
 
 const SUBAGENT_COLORS: Record<string, string> = {
   recon:   "text-sky-400",
@@ -292,7 +319,10 @@ const SUBAGENT_COLORS: Record<string, string> = {
   exploit: "text-rose-400",
 };
 
-function Message({ line }: { line: ChatLine }) {
+// Memoized: chat lines keep object identity across store updates (pushChat appends; applyDelta
+// only swaps the last line), so only the changed/streaming message re-runs ReactMarkdown — the
+// rest of the history stays put.
+const Message = memo(function Message({ line }: { line: ChatLine }) {
   if (line.kind === "user") {
     return (
       <div className="flex justify-end">
@@ -327,7 +357,7 @@ function Message({ line }: { line: ChatLine }) {
     return <SubAgentBubble name={name} text={body} />;
   }
   return <AgentBubble text={line.text} />;
-}
+});
 
 function ToolBlock({ text }: { text: string }) {
   const isCommand = text.startsWith("$ ");

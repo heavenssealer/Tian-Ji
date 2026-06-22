@@ -159,6 +159,10 @@ pub struct Orchestrator {
     /// Max tokens of context to pack per turn. Defaults conservatively (cost control on cloud
     /// models); the host raises it to match a local model's configured context window.
     context_budget: usize,
+    /// Small-context mode — set when the active model has a tiny window (e.g. an 8k local LLM).
+    /// Switches the system prompt to a terse variant, bounds notes/profile harder, tightens the
+    /// tool-output cap, and tells the agent not to delegate (sub-agents multiply context).
+    small_context: bool,
 }
 
 impl Orchestrator {
@@ -183,6 +187,7 @@ impl Orchestrator {
             command_cache: std::sync::Mutex::new(HashMap::new()),
             global_facts: std::sync::Mutex::new(Vec::new()),
             context_budget: 16_000,
+            small_context: false,
         }
     }
 
@@ -196,6 +201,18 @@ impl Orchestrator {
     pub fn with_context_budget(mut self, budget: usize) -> Self {
         self.context_budget = budget.max(2_000);
         self
+    }
+
+    /// Enable small-context mode (terse prompt, harder caps, no delegation) — for tiny local
+    /// windows. The host sets this from the model's configured context length.
+    pub fn with_small_context(mut self, small: bool) -> Self {
+        self.small_context = small;
+        self
+    }
+
+    /// Per-turn tool-output cap — tighter when the model's window is tiny.
+    fn tool_output_cap(&self) -> usize {
+        if self.small_context { 768 } else { 2_048 }
     }
 
     fn assembler(&self) -> ContextAssembler {
@@ -524,7 +541,7 @@ impl Orchestrator {
             history_before_len = history.len();
             // System prompt is rebuilt fresh each turn (scope/phase/notes may have changed).
             let mut msgs = vec![
-                Message { role: Role::System, content: vec![text(system_prompt(phase, &scope, &notes, self.free_mode.load(Ordering::SeqCst), &self.profile_for(store)))] },
+                Message { role: Role::System, content: vec![text(system_prompt(phase, &scope, &notes, self.free_mode.load(Ordering::SeqCst), &self.profile_for(store), self.small_context))] },
             ];
             msgs.extend(history.clone());
             msgs
@@ -548,7 +565,7 @@ impl Orchestrator {
                 break;
             }
 
-            ContextAssembler::cap_tool_output(&mut messages);
+            ContextAssembler::cap_tool_output_with(&mut messages, self.tool_output_cap());
             let trimmed = assembler.trim_to_budget(&messages);
             let mut stream = self
                 .provider
@@ -719,7 +736,7 @@ impl Orchestrator {
             "{}{recalled_hint}",
             system_prompt(
                 subagent_phase, &scope, &notes,
-                self.free_mode.load(Ordering::SeqCst), &self.profile_for(store),
+                self.free_mode.load(Ordering::SeqCst), &self.profile_for(store), self.small_context,
             )
         );
 
@@ -741,7 +758,7 @@ impl Orchestrator {
                 });
             }
 
-            ContextAssembler::cap_tool_output(&mut messages);
+            ContextAssembler::cap_tool_output_with(&mut messages, self.tool_output_cap());
             let trimmed = assembler.trim_to_budget(&messages);
             let mut stream = self
                 .subagent_provider
@@ -1252,13 +1269,33 @@ fn goal_prompt(goal: &str, first: bool) -> String {
     }
 }
 
+/// Truncate to at most `n` chars (char-safe), appending an ellipsis when cut.
+fn trunc(s: &str, n: usize) -> String {
+    if s.chars().count() > n {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
+/// Build the per-turn system prompt. `slim` switches to the terse, hard-bounded variant used when
+/// the model has a tiny window (small-context mode); it trims the instruction prose, caps the
+/// notebook/profile far harder, and tells the agent not to delegate (sub-agents multiply context).
+///
+/// Bounding notes/profile matters even on cloud: they are re-sent every turn and would otherwise
+/// grow without limit, taxing both cost and the cache-write size.
 fn system_prompt(
     phase: Phase,
     scope: &ScopeRules,
     notes: &[tianji_types::Event],
     free_mode: bool,
     profile: &[String],
+    slim: bool,
 ) -> String {
+    // Caps: (max notes, note chars, max facts, fact chars).
+    let (note_max, note_len, fact_max, fact_len) =
+        if slim { (5usize, 140usize, 6usize, 140usize) } else { (12, 240, 24, 240) };
+
     let phase_hint = match phase {
         Phase::Recon => "You are in the RECON phase: enumerate hosts/services with read-only tools.",
         Phase::Hypothesis => "You are in the HYPOTHESIS phase: reason about likely weaknesses.",
@@ -1276,68 +1313,100 @@ fn system_prompt(
         format!("Engagement scope: {}.", scope_entries.join(", "))
     };
 
-    let notes_hint = if notes.is_empty() {
+    // Notes arrive oldest-first; keep the most recent `note_max` (the tail) and bound each line.
+    let note_texts: Vec<&str> =
+        notes.iter().filter_map(|e| e.payload.get("text").and_then(|v| v.as_str())).collect();
+    let note_start = note_texts.len().saturating_sub(note_max);
+    let notes_hint = if note_texts.is_empty() {
         String::new()
     } else {
-        let lines = notes
+        let lines = note_texts[note_start..]
             .iter()
-            .filter_map(|e| e.payload.get("text").and_then(|v| v.as_str()))
-            .map(|t| format!("- {t}"))
+            .map(|t| format!("- {}", trunc(t, note_len)))
             .collect::<Vec<_>>()
             .join("\n");
         format!(" Operator notebook:\n{lines}")
     };
 
-    // Distilled profile — the operator's habits + what we know about this engagement. Always
-    // injected so the agent applies it proactively from the first message.
+    // Distilled profile — the operator's habits + what we know about this engagement. Bounded so a
+    // long-lived profile can't dominate the window.
     let profile_hint = if profile.is_empty() {
         String::new()
     } else {
-        let lines = profile.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
+        let lines = profile
+            .iter()
+            .take(fact_max)
+            .map(|f| format!("- {}", trunc(f, fact_len)))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!(
             " What you've learned about this operator and engagement (apply it proactively, but \
              the operator's explicit instructions always win):\n{lines}"
         )
     };
 
-    // Tell the model the operator OS so it picks the right command syntax.
-    let os_hint = if cfg!(windows) {
-        "The operator's machine runs Windows (cmd.exe/PowerShell). \
-         Use Windows-compatible flags for every command: \
-         `ping -n 4 <host>` (NOT `-c`), `nmap` flags are cross-platform, \
-         use `ipconfig` not `ifconfig`, `netstat -ano`, `dir` not `ls`, etc. \
-         Never emit Unix-only flags."
-    } else {
-        "The operator's machine runs Linux/macOS. Use POSIX syntax. \
-         For commands that need root (editing /etc/hosts, writing to /etc/, ip route, iptables, \
-         raw packet tools, etc.), prefix with `sudo` — use it as the tool name and pass the real \
-         command as arguments (e.g. tool=sudo argv=[\"tee\",\"-a\",\"/etc/hosts\"]). \
-         Network scanning tools such as nmap and masscan are auto-elevated by the runner when \
-         NOPASSWD sudo is configured."
+    // Tell the model the operator OS so it picks the right command syntax. Slim mode uses a one-line
+    // form to save tokens.
+    let os_hint = match (slim, cfg!(windows)) {
+        (true, true) => "Operator OS: Windows (cmd/PowerShell): `ping -n`, `ipconfig`, `dir`, \
+                         `netstat -ano`; never Unix-only flags.",
+        (true, false) => "Operator OS: Linux/macOS (POSIX). For root actions prefix sudo \
+                          (tool=sudo, argv=[real command]); nmap/masscan auto-elevate.",
+        (false, true) => "The operator's machine runs Windows (cmd.exe/PowerShell). \
+                          Use Windows-compatible flags for every command: \
+                          `ping -n 4 <host>` (NOT `-c`), `nmap` flags are cross-platform, \
+                          use `ipconfig` not `ifconfig`, `netstat -ano`, `dir` not `ls`, etc. \
+                          Never emit Unix-only flags.",
+        (false, false) => "The operator's machine runs Linux/macOS. Use POSIX syntax. \
+                           For commands that need root (editing /etc/hosts, writing to /etc/, ip route, iptables, \
+                           raw packet tools, etc.), prefix with `sudo` — use it as the tool name and pass the real \
+                           command as arguments (e.g. tool=sudo argv=[\"tee\",\"-a\",\"/etc/hosts\"]). \
+                           Network scanning tools such as nmap and masscan are auto-elevated by the runner when \
+                           NOPASSWD sudo is configured.",
     };
 
     // Missing-tool policy depends on the mode. OPEN mode = the operator's lab/own box, so the
     // agent may install what it needs; CONTROLLED mode = don't touch the system, just advise.
-    let install_hint = if free_mode {
-        if cfg!(windows) {
-            "OPEN MODE: if a required tool is missing (\"command not found\"), install it yourself \
+    let install_hint = match (slim, free_mode, cfg!(windows)) {
+        (true, true, _) => "OPEN MODE: install missing tools yourself, non-interactively \
+                            (apt-get -y / pip / choco -y / git clone).",
+        (true, false, _) => "CONTROLLED MODE: do not install or modify the machine; if a tool is \
+                             missing, give the exact install command and move on.",
+        (false, true, true) => "OPEN MODE: if a required tool is missing (\"command not found\"), install it yourself \
              before retrying — prefer non-interactive package managers (`choco install -y <pkg>`, \
              `winget install --silent <pkg>`, `pip install <pkg>`) or `git clone` the project. \
-             Never get stuck repeating a command for a tool that isn't installed."
-        } else {
-            "OPEN MODE: if a required tool is missing (\"command not found\"), install it yourself \
+             Never get stuck repeating a command for a tool that isn't installed.",
+        (false, true, false) => "OPEN MODE: if a required tool is missing (\"command not found\"), install it yourself \
              before retrying — use the platform package manager non-interactively \
              (`sudo apt-get install -y <pkg>`, `sudo apt update` first if needed, or pip/gem/go \
              install), or `git clone` the repo and run it. Never get stuck repeating a command for \
-             a tool that isn't installed."
-        }
-    } else {
-        "CONTROLLED MODE: you must NOT install software or modify the operator's machine. If a \
+             a tool that isn't installed.",
+        (false, false, _) => "CONTROLLED MODE: you must NOT install software or modify the operator's machine. If a \
          required tool is missing (\"command not found\"), do NOT keep retrying it — state which \
          tool is missing and the exact command the operator should run to install it (e.g. \
          `sudo apt-get install -y gobuster`), then continue making progress with the tools that \
-         ARE available."
+         ARE available.",
     };
+
+    if slim {
+        // Terse core — every token counts on an 8k-ish window.
+        return format!(
+            "You are an assistant to an authorized penetration tester. \
+             {scope_hint}{notes_hint}{profile_hint} \
+             Use run_command to run tools (tool name = the bare executable like \"nmap\"; \
+             pipes/redirects need tool=\"bash\", argv=[\"-c\", \"<full line>\"]). \
+             The moment you find an open port, vulnerable service, misconfiguration or any security \
+             issue, call record_finding (severity critical/high/medium/low/info, target like \
+             1.2.3.4:22/ssh, one-line summary). \
+             BE EXTREMELY TERSE: a few words of reasoning at most — no narration, no restating \
+             output, no plans. Spend tokens on tool calls and findings, not prose. \
+             Do NOT delegate to sub-agents — do the work inline (delegation multiplies context and \
+             won't fit this window). \
+             Never re-run a scan whose output is already above; read the earlier result. One port \
+             scan per host. Stay strictly within scope — never touch hosts outside it. \
+             {os_hint} {install_hint} {phase_hint}"
+        );
+    }
 
     format!(
         "You are an assistant to an authorized penetration tester. \
@@ -1409,23 +1478,41 @@ mod tests {
 
     #[test]
     fn open_mode_lets_the_agent_install_tools() {
-        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], true, &[]);
+        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], true, &[], false);
         assert!(p.contains("OPEN MODE"));
         assert!(p.to_lowercase().contains("install it yourself"));
     }
 
     #[test]
     fn controlled_mode_forbids_install_and_advises_operator() {
-        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[]);
+        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[], false);
         assert!(p.contains("CONTROLLED MODE"));
         assert!(p.contains("must NOT install"));
     }
 
     #[test]
     fn prompt_makes_delegation_the_default() {
-        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[]);
+        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[], false);
         assert!(p.contains("delegate_to_agent"));
         assert!(p.contains("DEFAULT for separable work"));
+    }
+
+    #[test]
+    fn slim_prompt_is_smaller_and_forbids_delegation() {
+        let full = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[], false);
+        let slim = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[], true);
+        assert!(slim.len() < full.len(), "slim prompt should be shorter");
+        assert!(slim.contains("Do NOT delegate"), "slim must forbid delegation");
+        assert!(!slim.contains("DEFAULT for separable work"));
+    }
+
+    #[test]
+    fn slim_prompt_bounds_the_profile() {
+        let facts: Vec<String> = (0..50).map(|i| format!("habit number {i}")).collect();
+        let slim = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &facts, true);
+        // Only the first 6 facts survive the slim cap.
+        assert!(slim.contains("habit number 5"));
+        assert!(!slim.contains("habit number 6"));
     }
 
     /// A scripted provider: each `run_turn` returns the next pre-baked round of events.
@@ -1588,6 +1675,7 @@ mod tests {
             &[],
             false,
             &["prefers ffuf over gobuster".to_string()],
+            false,
         );
         assert!(p.contains("prefers ffuf over gobuster"));
         assert!(p.contains("learned about this operator"));

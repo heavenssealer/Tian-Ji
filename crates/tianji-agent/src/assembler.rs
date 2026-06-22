@@ -92,14 +92,23 @@ impl ContextAssembler {
 
     /// Cap tool output in-place to prevent individual messages from dominating the context.
     pub fn cap_tool_output(messages: &mut Vec<Message>) {
+        Self::cap_tool_output_with(messages, TOOL_OUTPUT_CAP);
+    }
+
+    /// Same as [`cap_tool_output`] but with a caller-chosen cap — small-context (local) models use
+    /// a tighter cap so a single tool result can't swallow their tiny window.
+    pub fn cap_tool_output_with(messages: &mut Vec<Message>, cap: usize) {
+        let cap = cap.max(256);
         for msg in messages.iter_mut() {
             if msg.role == Role::Tool {
                 for c in &mut msg.content {
                     if let Content::ToolResult { output, .. } = c {
-                        if output.len() > TOOL_OUTPUT_CAP {
+                        if output.len() > cap {
+                            // Respect UTF-8 boundaries — `output` may contain multibyte chars.
+                            let end = (0..=cap).rev().find(|&i| output.is_char_boundary(i)).unwrap_or(0);
                             *output = format!(
                                 "{}…\n[truncated — {} total chars]",
-                                &output[..TOOL_OUTPUT_CAP],
+                                &output[..end],
                                 output.len()
                             );
                         }
