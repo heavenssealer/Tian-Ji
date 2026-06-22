@@ -12,7 +12,7 @@ use tianji_types::{AgentEvent, Message, ToolSpec};
 
 mod claude;
 mod ollama;
-pub use claude::ClaudeProvider;
+pub use claude::{ClaudeAuth, ClaudeProvider, TokenSource};
 pub use ollama::{list_ollama_models, OllamaProvider};
 
 #[derive(Debug, thiserror::Error)]

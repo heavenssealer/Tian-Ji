@@ -6,6 +6,7 @@
 
 mod commands;
 mod events;
+mod oauth;
 mod secrets;
 mod state;
 
@@ -63,6 +64,10 @@ fn main() {
             commands::notes::notes_update,
             commands::query::events_query,
             commands::query::findings_query,
+            commands::auth::auth_begin,
+            commands::auth::auth_complete,
+            commands::auth::auth_status,
+            commands::auth::auth_disconnect,
             commands::settings::settings_set_api_key,
             commands::settings::settings_has_api_key,
             commands::settings::settings_set_sudo_password,

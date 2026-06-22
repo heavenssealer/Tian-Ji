@@ -21,8 +21,8 @@ const MODELS: &[&str] = &[
     "ollama:mistral-nemo",
 ];
 
-/// Rebuild the open workspace's orchestrator (after a key or model change).
-fn rebuild_current(state: &AppState) -> AppResult<()> {
+/// Rebuild the open workspace's orchestrator (after a key, subscription, or model change).
+pub(crate) fn rebuild_current(state: &AppState) -> AppResult<()> {
     let open = { state.current.lock().unwrap().as_ref().map(|cw| cw.meta.clone()) };
     if let Some(meta) = open {
         let store = WorkspaceStore::open(std::path::Path::new(&meta.root_path))?;

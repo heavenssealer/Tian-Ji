@@ -25,6 +25,13 @@ anyhow = "1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Subscription (OAuth) login: PKCE + token exchange against Anthropic's OAuth endpoints.
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+url = "2"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }

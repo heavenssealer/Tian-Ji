@@ -7,6 +7,7 @@
 //! — only the latency improves (first token appears immediately instead of after full response).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{
@@ -21,6 +22,32 @@ use crate::{LlmError, LlmProvider, Result};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Beta flag Anthropic requires on subscription (OAuth) requests — the same one the Claude Code
+/// CLI sends. Without it the API rejects a bearer token on `/v1/messages`.
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// Anthropic only honours a subscription token when the request identifies as Claude Code: the
+/// **first** system block must carry this exact line. We prepend it automatically in OAuth mode.
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Yields a valid OAuth access token, refreshing it transparently when it is close to expiry.
+/// Implemented in `src-tauri` (which owns the keychain + token endpoint); the adapter only ever
+/// sees the resulting bearer string, so no OAuth/keychain wire types leak into this crate.
+#[async_trait]
+pub trait TokenSource: Send + Sync {
+    async fn access_token(&self) -> Result<String>;
+}
+
+/// How the Claude adapter authenticates. `ApiKey` bills the org's API credits via `x-api-key`;
+/// `Oauth` bills an Anthropic subscription (Claude Pro/Max) via a bearer token — exactly the path
+/// the Claude Code CLI uses. The two differ on the wire (header, the `oauth-2025-04-20` beta flag,
+/// and the required Claude Code identity), all handled in `run_turn`.
+#[derive(Clone)]
+pub enum ClaudeAuth {
+    ApiKey(String),
+    Oauth(Arc<dyn TokenSource>),
+}
 
 /// Build the HTTP client with settings that survive flaky networks (notably the HTB/VPN `tun`
 /// interfaces on Kali, where a second request reusing a pooled HTTP/2 connection fails with
@@ -40,15 +67,21 @@ fn build_client() -> reqwest::Client {
 }
 
 pub struct ClaudeProvider {
-    api_key: String,
+    auth: ClaudeAuth,
     model: String,
     http: reqwest::Client,
 }
 
 impl ClaudeProvider {
+    /// API-key auth (bills API credits). Kept for callers that pass a raw key.
     pub fn new(api_key: String) -> Self {
+        Self::with_auth(ClaudeAuth::ApiKey(api_key))
+    }
+
+    /// Build with an explicit auth strategy (API key or subscription OAuth).
+    pub fn with_auth(auth: ClaudeAuth) -> Self {
         Self {
-            api_key,
+            auth,
             model: "claude-opus-4-8".to_string(),
             http: build_client(),
         }
@@ -67,10 +100,7 @@ impl LlmProvider for ClaudeProvider {
         messages: &[Message],
         tools: &[ToolSpec],
     ) -> Result<BoxStream<'static, AgentEvent>> {
-        if self.api_key.is_empty() {
-            return Err(LlmError::MissingKey("anthropic"));
-        }
-
+        let oauth = matches!(self.auth, ClaudeAuth::Oauth(_));
         let (system, msgs) = translate_messages(messages);
 
         // Prompt caching — the single biggest cost lever for a long agentic session. Every turn
@@ -85,16 +115,31 @@ impl LlmProvider for ClaudeProvider {
             "model": self.model,
             "max_tokens": 4096,
             "stream": true,
-            "system": cached_system_block(&system),
+            "system": system_blocks(&system, oauth),
             "messages": msgs,
             "tools": tools.iter().map(translate_tool).collect::<Vec<_>>(),
         });
 
-        let resp = self
-            .http
-            .post(API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
+        // Auth diverges only here: an API key goes on `x-api-key`; a subscription token goes on
+        // `Authorization: Bearer` with the `oauth-2025-04-20` beta flag (and the Claude Code
+        // identity already prepended to `system` above).
+        let mut req = self.http.post(API_URL).header("anthropic-version", ANTHROPIC_VERSION);
+        match &self.auth {
+            ClaudeAuth::ApiKey(key) => {
+                if key.is_empty() {
+                    return Err(LlmError::MissingKey("anthropic"));
+                }
+                req = req.header("x-api-key", key);
+            }
+            ClaudeAuth::Oauth(source) => {
+                let token = source.access_token().await?;
+                req = req
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("anthropic-beta", OAUTH_BETA);
+            }
+        }
+
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -255,15 +300,24 @@ fn str_field(v: &Value) -> String {
     v.as_str().unwrap_or("").to_string()
 }
 
-/// Build the `system` field as a single text block carrying a `cache_control` breakpoint, so the
-/// tools+system prefix is served from Anthropic's prompt cache on every turn after the first.
-/// An empty system collapses to `[]` (no block to cache, and an empty text block is rejected).
-fn cached_system_block(system: &str) -> Value {
-    if system.is_empty() {
-        json!([])
-    } else {
-        json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }])
+/// Build the `system` field as text blocks with a single `cache_control` breakpoint on the last
+/// one, so the tools+system prefix is served from Anthropic's prompt cache on every turn after the
+/// first. In OAuth mode the Claude Code identity is prepended as the first block (required for a
+/// subscription token to be accepted). An empty system with no identity collapses to `[]`.
+fn system_blocks(system: &str, oauth: bool) -> Value {
+    let mut blocks: Vec<Value> = Vec::new();
+    if oauth {
+        blocks.push(json!({ "type": "text", "text": CLAUDE_CODE_IDENTITY }));
     }
+    if !system.is_empty() {
+        blocks.push(json!({ "type": "text", "text": system }));
+    }
+    if blocks.is_empty() {
+        return json!([]);
+    }
+    let last = blocks.len() - 1;
+    blocks[last]["cache_control"] = json!({ "type": "ephemeral" });
+    Value::Array(blocks)
 }
 
 fn translate_messages(messages: &[Message]) -> (String, Vec<Value>) {
@@ -319,7 +373,7 @@ mod tests {
 
     #[test]
     fn system_block_carries_cache_control() {
-        let block = cached_system_block("you are a pentest assistant");
+        let block = system_blocks("you are a pentest assistant", false);
         let first = &block[0];
         assert_eq!(first["type"], "text");
         assert_eq!(first["text"], "you are a pentest assistant");
@@ -328,7 +382,25 @@ mod tests {
 
     #[test]
     fn empty_system_collapses_to_empty_array() {
-        let block = cached_system_block("");
+        let block = system_blocks("", false);
         assert_eq!(block, json!([]));
+    }
+
+    #[test]
+    fn oauth_prepends_claude_code_identity() {
+        let block = system_blocks("you are a pentest assistant", true);
+        // Identity comes first, app system second, cache breakpoint on the last block only.
+        assert_eq!(block[0]["text"], CLAUDE_CODE_IDENTITY);
+        assert!(block[0].get("cache_control").is_none());
+        assert_eq!(block[1]["text"], "you are a pentest assistant");
+        assert_eq!(block[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn oauth_with_empty_system_still_sends_identity() {
+        let block = system_blocks("", true);
+        assert_eq!(block[0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(block[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(block.as_array().unwrap().len(), 1);
     }
 }

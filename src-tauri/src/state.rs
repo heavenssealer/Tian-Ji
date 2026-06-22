@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tianji_agent::Orchestrator;
-use tianji_llm::{ClaudeProvider, LlmProvider, OllamaProvider};
+use tianji_llm::{ClaudeAuth, ClaudeProvider, LlmProvider, OllamaProvider};
 use tianji_pty::PtyManager;
 use tianji_store::{AppStore, WorkspaceMeta, WorkspaceStore};
 
@@ -65,6 +65,9 @@ pub struct AppState {
     /// of 0 = unlimited.
     pub tokens_spent: Arc<AtomicU64>,
     pub token_budget: Arc<AtomicU64>,
+    /// An in-flight subscription login between `auth_begin` and `auth_complete` (PKCE verifier +
+    /// state). Single-use and short-lived, so it lives here rather than in the keychain.
+    pub pending_oauth: Mutex<Option<crate::oauth::PendingOauth>>,
 }
 
 impl AppState {
@@ -85,6 +88,7 @@ impl AppState {
             free_mode: Arc::new(AtomicBool::new(false)),
             tokens_spent: Arc::new(AtomicU64::new(0)),
             token_budget: Arc::new(AtomicU64::new(budget)),
+            pending_oauth: Mutex::new(None),
         }
     }
 
@@ -151,8 +155,8 @@ pub fn ollama_num_ctx(app: &AppStore) -> u32 {
 
 /// Build the right provider for a model id. A `ollama:<name>` prefix selects the local Ollama
 /// backend (free, no API key) at `ollama_host` with the given context window; anything else is a
-/// cloud Claude model.
-fn build_provider(model: &str, api_key: String, ollama_host: &str, num_ctx: u32) -> Arc<dyn LlmProvider> {
+/// cloud Claude model, authenticated per `auth` (subscription OAuth or API key).
+fn build_provider(model: &str, auth: ClaudeAuth, ollama_host: &str, num_ctx: u32) -> Arc<dyn LlmProvider> {
     if let Some(local) = model.strip_prefix("ollama:") {
         Arc::new(
             OllamaProvider::new(local.trim())
@@ -160,7 +164,19 @@ fn build_provider(model: &str, api_key: String, ollama_host: &str, num_ctx: u32)
                 .with_num_ctx(num_ctx),
         )
     } else {
-        Arc::new(ClaudeProvider::new(api_key).with_model(model))
+        Arc::new(ClaudeProvider::with_auth(auth).with_model(model))
+    }
+}
+
+/// Decide how to authenticate Claude requests. A connected Anthropic subscription (OAuth tokens in
+/// the keychain) takes precedence over the API key — turns then bill the subscription, not credits.
+/// Disconnect the subscription to fall back to the API key.
+fn claude_auth() -> ClaudeAuth {
+    if crate::oauth::load_tokens().ok().flatten().is_some() {
+        ClaudeAuth::Oauth(Arc::new(crate::oauth::KeychainOauthSource))
+    } else {
+        let key = crate::secrets::get_api_key("anthropic").ok().flatten().unwrap_or_default();
+        ClaudeAuth::ApiKey(key)
     }
 }
 
@@ -187,15 +203,15 @@ impl CurrentWorkspace {
         token_budget: Arc<AtomicU64>,
         app: &AppStore,
     ) -> Self {
-        let key = crate::secrets::get_api_key("anthropic").ok().flatten().unwrap_or_default();
+        let auth = claude_auth();
         let sudo_pw = crate::secrets::get_api_key("sudo").ok().flatten();
         let host = ollama_host(app);
         let num_ctx = ollama_num_ctx(app);
-        let provider = build_provider(model, key.clone(), &host, num_ctx);
+        let provider = build_provider(model, auth.clone(), &host, num_ctx);
 
         // Sub-agents do focused grunt work — never run them on Opus. Cap them at Sonnet (or reuse
         // an already-cheaper / local model). A big cost lever: engagements spawn many sub-rounds.
-        let subagent_provider = build_provider(&subagent_model_for(model), key, &host, num_ctx);
+        let subagent_provider = build_provider(&subagent_model_for(model), auth, &host, num_ctx);
 
         // How much history to pack per turn. On a local model, match its context window (reserving
         // headroom for the reply); on cloud models stay conservative for cost.

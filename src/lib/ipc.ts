@@ -47,6 +47,11 @@ export const ipc = {
   eventsQuery: (limit: number) => invoke<EventDto[]>("events_query", { limit }),
   findingsQuery: () => invoke<FindingDto[]>("findings_query"),
 
+  authBegin: () => invoke<string>("auth_begin"),
+  authComplete: (code: string) => invoke<void>("auth_complete", { code }),
+  authStatus: () => invoke<boolean>("auth_status"),
+  authDisconnect: () => invoke<void>("auth_disconnect"),
+
   settingsSetApiKey: (key: string) => invoke<void>("settings_set_api_key", { key }),
   settingsHasApiKey: () => invoke<boolean>("settings_has_api_key"),
   settingsSetSudoPassword: (password: string) => invoke<void>("settings_set_sudo_password", { password }),
