@@ -5,6 +5,7 @@ import type { EventDto, FindingDto, Phase, ProfileFact, ProfileScope } from "../
 import { useAppStore } from "../../state/stores";
 import NotesEditorModal from "./NotesEditorModal";
 import ReportModal from "./ReportModal";
+import Select from "../Select";
 
 const AUTO_KINDS = new Set(["tool_output", "finding", "agent_msg", "phase_change", "tool_denied"]);
 
@@ -103,7 +104,7 @@ export default function NotesPanel() {
 
   return (
     <div className="flex h-full flex-col bg-base-700 text-xs">
-      <div className="flex h-9 shrink-0 items-center gap-1 border-b border-base-500 px-2">
+      <div className="flex h-9 shrink-0 items-center gap-1 overflow-x-auto border-b border-base-500 px-2">
         <Tab active={tab === "auto"} onClick={() => setTab("auto")}>
           Auto
         </Tab>
@@ -128,7 +129,7 @@ export default function NotesPanel() {
         </Tab>
         <button
           onClick={() => setEditorOpen(true)}
-          className="ml-auto flex h-5 w-5 items-center justify-center rounded text-ink-faint hover:bg-base-600 hover:text-ink"
+          className="ml-auto flex h-5 w-5 shrink-0 items-center justify-center rounded text-ink-faint hover:bg-base-600 hover:text-ink"
           title="Open notes editor"
         >
           ✎
@@ -274,14 +275,16 @@ export default function NotesPanel() {
           </div>
 
           <div className="flex shrink-0 items-center gap-1 border-t border-base-500 p-2">
-            <select
+            <Select
               value={factScope}
-              onChange={(e) => setFactScope(e.target.value as ProfileScope)}
-              className="shrink-0 rounded bg-base-800 px-1 py-1 text-[10px] text-ink-dim ring-1 ring-base-500 outline-none"
-            >
-              <option value="global">global</option>
-              <option value="workspace">engagement</option>
-            </select>
+              options={[
+                { value: "global", label: "global" },
+                { value: "workspace", label: "engagement" },
+              ]}
+              onChange={(v) => setFactScope(v as ProfileScope)}
+              placement="top"
+              className="w-28 shrink-0"
+            />
             <input
               value={factDraft}
               onChange={(e) => setFactDraft(e.target.value)}
@@ -379,7 +382,7 @@ function Tab({
   return (
     <button
       onClick={onClick}
-      className={`label flex items-center rounded-md px-2 py-1 transition-colors ${
+      className={`label flex shrink-0 items-center rounded-md px-2 py-1 transition-colors ${
         active ? "bg-accent/12 !text-accent ring-1 ring-accent/25" : "hover:bg-base-600"
       }`}
     >

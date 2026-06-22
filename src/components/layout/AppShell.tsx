@@ -1,16 +1,29 @@
 import { useEffect, useRef, useState } from "react";
 import WorkspaceRail from "./WorkspaceRail";
-import PhaseTimeline from "./PhaseTimeline";
 import TerminalGrid from "../terminals/TerminalGrid";
 import AgentChat from "../agent/AgentChat";
 import NotesPanel from "../notes/NotesPanel";
 import SettingsButton from "../SettingsButton";
+import Select from "../Select";
 import { useBackendEvents } from "../../lib/backend";
 import { useAppStore } from "../../state/stores";
 import { ipc } from "../../lib/ipc";
+import type { Phase } from "../../lib/types";
 
-const RIGHT_MIN = 260;
-const RIGHT_MAX = 700;
+// Phase steers the agent prompt and stamps events (powers the Auto-tab filter). Kept as a compact
+// header dropdown rather than a full timeline bar.
+const PHASE_OPTIONS: { value: Phase; label: string }[] = [
+  { value: "recon", label: "recon" },
+  { value: "hypothesis", label: "hypothesis" },
+  { value: "poc", label: "PoC" },
+  { value: "exploit", label: "exploit" },
+  { value: "report", label: "report" },
+];
+
+const RIGHT_MIN = 320;
+const RIGHT_MAX = 760;
+const NOTES_MIN = 120;
+const NOTES_MAX_MARGIN = 220; // keep at least this much for the terminal above
 
 // Fired by both the global keydown handler and the xterm pane handler after saving.
 export const NOTEBOOK_SAVED_EVENT = "tianji:notebook-saved";
@@ -21,10 +34,21 @@ export default function AppShell() {
   const workspaces = useAppStore((s) => s.workspaces);
   const currentId = useAppStore((s) => s.currentWorkspaceId);
   const phase = useAppStore((s) => s.phase);
+  const setPhase = useAppStore((s) => s.setPhase);
   const current = workspaces.find((w) => w.id === currentId);
 
-  const [rightWidth, setRightWidth] = useState(340);
+  const selectPhase = (p: Phase) => {
+    setPhase(p);
+    void ipc.workspaceSetPhase(p).catch(() => {});
+  };
+
+  const [rightWidth, setRightWidth] = useState(420);
   const drag = useRef<{ startX: number; startW: number } | null>(null);
+
+  // Notes panel lives at the bottom of the center column; its height is drag-resizable.
+  const [notesHeight, setNotesHeight] = useState(260);
+  const vdrag = useRef<{ startY: number; startH: number } | null>(null);
+  const centerRef = useRef<HTMLDivElement>(null);
 
   // Toast shown after a successful Ctrl+Shift+N capture.
   const [toastVisible, setToastVisible] = useState(false);
@@ -74,6 +98,24 @@ export default function AppShell() {
     window.addEventListener("mouseup", onUp);
   };
 
+  const startVDrag = (e: React.MouseEvent) => {
+    e.preventDefault();
+    vdrag.current = { startY: e.clientY, startH: notesHeight };
+    const onMove = (ev: MouseEvent) => {
+      if (!vdrag.current) return;
+      const h = vdrag.current.startH + (vdrag.current.startY - ev.clientY);
+      const max = (centerRef.current?.clientHeight ?? window.innerHeight) - NOTES_MAX_MARGIN;
+      setNotesHeight(Math.max(NOTES_MIN, Math.min(Math.max(NOTES_MIN, max), h)));
+    };
+    const onUp = () => {
+      vdrag.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
   return (
     <div
       className="grid h-screen w-full grid-rows-[48px_minmax(0,1fr)] overflow-hidden bg-base-900 text-ink"
@@ -93,13 +135,18 @@ export default function AppShell() {
 
       {/* Top bar over the main + right columns */}
       <header className="col-start-2 col-span-2 row-start-1 flex items-center gap-3 border-b border-base-500 px-4">
-        <span className="text-[13px] font-medium text-ink">
+        <span className="min-w-0 truncate text-[13px] font-medium text-ink">
           {current ? current.name : "No workspace"}
         </span>
         {current && (
-          <span className="label rounded bg-base-700 px-2 py-0.5 !text-accent">{phase}</span>
+          <Select
+            value={phase}
+            options={PHASE_OPTIONS}
+            onChange={(p) => selectPhase(p as Phase)}
+            className="w-32 shrink-0"
+          />
         )}
-        <div className="ml-auto flex items-center gap-3">
+        <div className="ml-auto flex shrink-0 items-center gap-3">
           <SettingsButton />
           <span className="flex items-center gap-1.5 text-[11px] text-ink-faint">
             <span className="h-1.5 w-1.5 rounded-full bg-ok" /> v0.1
@@ -107,25 +154,30 @@ export default function AppShell() {
         </div>
       </header>
 
-      {/* Center: phase timeline + terminal grid */}
-      <main className="col-start-2 row-start-2 flex min-h-0 min-w-0 flex-col">
-        <PhaseTimeline />
-        <TerminalGrid />
+      {/* Center: phase timeline + terminal grid (top) + notes (bottom, height-resizable). */}
+      <main ref={centerRef} className="col-start-2 row-start-2 flex min-h-0 min-w-0 flex-col">
+        <div className="flex min-h-0 flex-1 flex-col">
+          <TerminalGrid />
+        </div>
+        {/* Horizontal splitter between terminal and notes. */}
+        <div
+          className="h-1 shrink-0 cursor-row-resize bg-base-500 transition-colors hover:bg-accent/50"
+          onMouseDown={startVDrag}
+          title="Drag to resize notes"
+        />
+        <div className="min-h-0 shrink-0 overflow-hidden" style={{ height: notesHeight }}>
+          <NotesPanel />
+        </div>
       </main>
 
-      {/* Right: agent chat (top) + notes (bottom). Left border doubles as drag handle. */}
+      {/* Right: agent chat, full height. Left border doubles as drag handle. */}
       <aside className="relative col-start-3 row-start-2 flex min-h-0 flex-col border-l border-base-500 bg-base-700">
         <div
           className="absolute inset-y-0 left-0 z-20 w-1 cursor-col-resize transition-colors hover:bg-accent/50"
           onMouseDown={startDrag}
           title="Drag to resize"
         />
-        <div className="min-h-0 flex-1">
-          <AgentChat />
-        </div>
-        <div className="h-2/5 border-t border-base-500">
-          <NotesPanel />
-        </div>
+        <AgentChat />
       </aside>
     </div>
   );

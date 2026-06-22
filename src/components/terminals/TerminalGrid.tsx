@@ -32,13 +32,13 @@ export default function TerminalGrid() {
 
   return (
     <div className="flex flex-1 min-h-0 flex-col bg-base-800">
-      <div className="flex h-9 shrink-0 items-center gap-1 border-b border-base-500 px-2.5">
-        <span className="label mr-1">terminals</span>
+      <div className="flex h-9 shrink-0 items-center gap-1 overflow-x-auto border-b border-base-500 px-2.5">
+        <span className="label mr-1 shrink-0">terminals</span>
         {tabs.map((id, i) => (
           <span
             key={id}
             onClick={() => setActive(id)}
-            className={`group flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] font-mono transition-colors ${
+            className={`group flex shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] font-mono transition-colors ${
               id === active ? "bg-accent/12 text-accent ring-1 ring-accent/25" : "text-ink-faint hover:bg-base-600"
             }`}
           >
@@ -59,7 +59,7 @@ export default function TerminalGrid() {
         ))}
         <button
           onClick={add}
-          className="flex h-5 w-5 items-center justify-center rounded text-ink-faint hover:bg-base-600 hover:text-ink"
+          className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-ink-faint hover:bg-base-600 hover:text-ink"
           title="New terminal"
         >
           +

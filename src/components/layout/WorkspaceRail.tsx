@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ipc } from "../../lib/ipc";
 import { useAppStore } from "../../state/stores";
 import Modal, { fieldClass, GhostButton, PrimaryButton } from "../Modal";
+import Select from "../Select";
 import type { WorkspaceInfo } from "../../lib/types";
 import PolicyRulesModal from "../policy/PolicyRulesModal";
 
@@ -432,21 +433,24 @@ function ModelSelect() {
     await ipc.settingsSetModel(m).catch(() => {});
   };
 
+  const options = (models.length > 0 ? models : model ? [model] : []).map((m) => ({
+    value: m,
+    label: m,
+  }));
+
   return (
     <div className="border-t border-base-500 px-2.5 py-2.5">
       <div className="flex items-center gap-2">
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent" />
-        <select
+        <Select
           value={model}
-          onChange={(e) => void change(e.target.value)}
-          onFocus={() => void ipc.settingsListModels().then(setModels).catch(() => {})}
-          className="w-full cursor-pointer rounded-md border border-base-500 bg-base-800 px-2 py-1 font-mono text-[11px] text-ink-dim outline-none hover:border-base-400 focus:border-accent/50"
-        >
-          {models.length === 0 && <option>{model || "model"}</option>}
-          {models.map((m) => (
-            <option key={m} value={m} className="bg-base-800">{m}</option>
-          ))}
-        </select>
+          options={options}
+          onChange={(m) => void change(m)}
+          onOpen={() => void ipc.settingsListModels().then(setModels).catch(() => {})}
+          placement="top"
+          placeholder="model"
+          className="flex-1"
+        />
       </div>
     </div>
   );

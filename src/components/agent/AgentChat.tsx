@@ -117,7 +117,7 @@ export default function AgentChat() {
   return (
     <div className="flex h-full flex-col">
       {/* Session tab bar */}
-      <div className="flex h-8 shrink-0 items-center gap-0.5 overflow-x-auto border-b border-base-500 bg-base-900 px-1">
+      <div className="flex h-9 shrink-0 items-center gap-0.5 overflow-x-auto border-b border-base-500 bg-base-900 px-1">
         {sessions.map((s) => (
           <button
             key={s.id}
@@ -140,8 +140,8 @@ export default function AgentChat() {
         </button>
       </div>
 
-      {/* Toolbar */}
-      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-base-500 px-3">
+      {/* Toolbar — wraps to a second row at narrow widths instead of clipping. */}
+      <div className="flex min-h-9 shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-base-500 px-3 py-1">
         <span className="label">Agent</span>
         {isRunning && (
           <span className="flex items-center gap-1 text-[10px] text-ink-faint">
@@ -149,7 +149,7 @@ export default function AgentChat() {
             {isStandalone && goalIteration > 0 ? `autonomous · step ${goalIteration}` : "thinking…"}
           </span>
         )}
-        <div className="ml-auto flex items-center gap-1.5">
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-1.5">
           {(totalTokens.input + totalTokens.output) > 0 && (
             <span
               className={`font-mono text-[10px] ${
