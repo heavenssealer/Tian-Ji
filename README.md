@@ -198,10 +198,13 @@ A cloud agent authenticates one of two ways, configured in the Settings panel (�
   exactly like the Claude Code CLI. Takes precedence over an API key when both are present.
 - **Anthropic API key** — billed to your org's API credits. Get one at
   [console.anthropic.com](https://console.anthropic.com).
+- **DeepSeek API key** — for the `deepseek-*` models (OpenAI-compatible). Paste a key from
+  [platform.deepseek.com](https://platform.deepseek.com); billed to your DeepSeek account.
 
-Either credential is stored in the OS keychain (Windows Credential Manager / macOS Keychain /
+Each credential is stored in the OS keychain (Windows Credential Manager / macOS Keychain /
 GNOME Keyring or KDE Wallet) and never written to disk in plaintext. Disconnect the subscription
-to fall back to the API key.
+to fall back to the Anthropic API key; the DeepSeek key is only used when a `deepseek-*` model is
+selected.
 
 **Local models (no key required):** select an `ollama:<model>` entry in the model picker to run
 fully offline against a local [Ollama](https://ollama.com) instance (`ollama pull <model>` first).
@@ -210,8 +213,9 @@ Sensitive engagements stay on-box. Configure the Ollama host and context window 
 ### Model picker
 
 Pick the orchestrator model in Settings — `claude-opus-4-8` (default), `claude-sonnet-4-6`,
-`claude-haiku-4-5`, or any pulled `ollama:` model. Sub-agents never run on Opus: if you pick Opus
-for the orchestrator, delegated sub-agents drop to Sonnet automatically (a major cost lever).
+`claude-haiku-4-5`, a DeepSeek model (`deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-pro`,
+`deepseek-v4-flash`), or any pulled `ollama:` model. Sub-agents drop to a cheaper sibling for grunt
+work: Opus→Sonnet and DeepSeek's reasoner→chat automatically (a major cost lever).
 
 ## Token economy
 

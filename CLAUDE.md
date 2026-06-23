@@ -44,7 +44,7 @@ Dependencies point inward toward `tianji-types`; nothing depends on `src-tauri`;
 | `tianji-policy` | **The safety spine.** Pure, no I/O: `resolve_targets` → `classify` → `decide`. Fails closed (unknown ⇒ `NeedsApproval`). |
 | `tianji-store` | Append-only SQLite event log + cached read-models (findings, terminals, conversations, facts). One DB per workspace + a global `AppStore`. |
 | `tianji-pty` | PTY manager (portable-pty). |
-| `tianji-llm` | `LlmProvider` trait + the `ClaudeProvider` (SSE) and `OllamaProvider` adapters. The **only** place SDK/wire types are allowed. |
+| `tianji-llm` | `LlmProvider` trait + the `ClaudeProvider` (SSE), `OllamaProvider` (local), and `DeepSeekProvider` (OpenAI-compatible) adapters. The **only** place SDK/wire types are allowed. |
 | `tianji-agent` | The orchestrator loop, in-process MCP host, context assembler, approval gate, command runner, skills, summarizer. |
 | `src-tauri` | IPC glue only: commands (`src/commands/`), event emitters (`events.rs`), `AppState`/`CurrentWorkspace` wiring (`state.rs`), keychain (`secrets.rs`), subscription OAuth (`oauth.rs`). |
 

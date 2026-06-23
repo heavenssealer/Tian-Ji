@@ -7,6 +7,8 @@ export default function SettingsButton() {
   const [open, setOpen] = useState(false);
   const [hasKey, setHasKey] = useState(false);
   const [key, setKey] = useState("");
+  const [hasDeepseek, setHasDeepseek] = useState(false);
+  const [deepseekKey, setDeepseekKey] = useState("");
   const [hasSub, setHasSub] = useState(false);
   const [authUrl, setAuthUrl] = useState("");
   const [authCode, setAuthCode] = useState("");
@@ -22,6 +24,7 @@ export default function SettingsButton() {
 
   const refresh = () => {
     ipc.settingsHasApiKey().then(setHasKey).catch(() => {});
+    ipc.settingsHasDeepseekKey().then(setHasDeepseek).catch(() => {});
     ipc.authStatus().then(setHasSub).catch(() => {});
     ipc.settingsHasSudoPassword().then(setHasSudo).catch(() => {});
     ipc.settingsGetOllamaHost().then(setOllamaHost).catch(() => {});
@@ -112,6 +115,10 @@ export default function SettingsButton() {
       if (key.trim()) {
         await ipc.settingsSetApiKey(key.trim());
         setKey("");
+      }
+      if (deepseekKey.trim()) {
+        await ipc.settingsSetDeepseekKey(deepseekKey.trim());
+        setDeepseekKey("");
       }
       if (sudoPw.trim()) {
         await ipc.settingsSetSudoPassword(sudoPw.trim());
@@ -220,6 +227,24 @@ export default function SettingsButton() {
               className={fieldClass}
             />
             {hasKey && <p className="mt-1 text-[11px] text-ok">A key is currently set.</p>}
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-1.5 block text-[11px] font-medium text-ink-dim">
+              DeepSeek API key <span className="font-normal text-ink-faint">(for the <code>deepseek-*</code> models)</span>
+            </label>
+            <input
+              type="password"
+              value={deepseekKey}
+              onChange={(e) => setDeepseekKey(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && void save()}
+              placeholder="sk-…"
+              className={fieldClass}
+            />
+            {hasDeepseek
+              ? <p className="mt-1 text-[11px] text-ok">A DeepSeek key is set — pick a <code>deepseek-*</code> model in the picker.</p>
+              : <p className="mt-1 text-[11px] text-ink-faint">Get one at platform.deepseek.com. Billed to your DeepSeek account.</p>
+            }
           </div>
 
           <div className="mb-4">

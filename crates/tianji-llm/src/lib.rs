@@ -1,8 +1,9 @@
 //! # tianji-llm — provider abstraction (DESIGN.md §7.1)
 //!
-//! The orchestrator depends on the [`LlmProvider`] trait and our own neutral types only. v0.1
-//! ships **`ClaudeProvider`** as the single implementation; OpenAI/local are later additive
-//! files implementing the same trait — no change to the orchestrator, policy, memory, or UI.
+//! The orchestrator depends on the [`LlmProvider`] trait and our own neutral types only. Adapters
+//! are additive files implementing the same trait — no change to the orchestrator, policy, memory,
+//! or UI: [`ClaudeProvider`] (Anthropic, SSE + prompt caching), [`OllamaProvider`] (local), and
+//! [`DeepSeekProvider`] (OpenAI-compatible Chat Completions).
 //!
 //! **Rule: provider SDK/wire types never escape this crate.**
 
@@ -11,8 +12,10 @@ use futures::stream::BoxStream;
 use tianji_types::{AgentEvent, Message, ToolSpec};
 
 mod claude;
+mod deepseek;
 mod ollama;
 pub use claude::{ClaudeAuth, ClaudeProvider, TokenSource};
+pub use deepseek::DeepSeekProvider;
 pub use ollama::{list_ollama_models, OllamaProvider};
 
 #[derive(Debug, thiserror::Error)]

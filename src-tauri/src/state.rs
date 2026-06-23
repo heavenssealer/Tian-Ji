@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tianji_agent::Orchestrator;
-use tianji_llm::{ClaudeAuth, ClaudeProvider, LlmProvider, OllamaProvider};
+use tianji_llm::{ClaudeAuth, ClaudeProvider, DeepSeekProvider, LlmProvider, OllamaProvider};
 use tianji_pty::PtyManager;
 use tianji_store::{AppStore, WorkspaceMeta, WorkspaceStore};
 
@@ -114,12 +114,16 @@ impl AppState {
     }
 }
 
-/// Model to use for delegated sub-agents: never Opus. If the operator picked Opus for the
-/// orchestrator, sub-agents drop to Sonnet; any other (already cheaper) choice is kept as-is.
-/// Local (`ollama:`) models contain no "opus", so they pass through unchanged — already free.
+/// Model to use for delegated sub-agents: drop to a cheaper sibling for grunt work. Opus →
+/// Sonnet; DeepSeek's reasoner → its (faster, cheaper) chat model. Any other choice — including
+/// local `ollama:` models (already free) — passes through unchanged.
 fn subagent_model_for(model: &str) -> String {
     if model.contains("opus") {
         "claude-sonnet-4-6".to_string()
+    } else if model == "deepseek-reasoner" {
+        "deepseek-chat".to_string()
+    } else if model == "deepseek-v4-pro" {
+        "deepseek-v4-flash".to_string()
     } else {
         model.to_string()
     }
@@ -186,6 +190,11 @@ fn build_provider(model: &str, auth: ClaudeAuth, ollama_host: &str, num_ctx: u32
                 .with_base_url(ollama_host)
                 .with_num_ctx(num_ctx),
         )
+    } else if model.starts_with("deepseek") {
+        // DeepSeek is an OpenAI-compatible cloud model with its own API key (no OAuth, no shared
+        // Anthropic auth). An absent key is allowed — the provider errors only when a turn runs.
+        let key = crate::secrets::get_api_key("deepseek").ok().flatten().unwrap_or_default();
+        Arc::new(DeepSeekProvider::new(key, model))
     } else {
         Arc::new(ClaudeProvider::with_auth(auth).with_model(model))
     }

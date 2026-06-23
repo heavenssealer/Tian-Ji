@@ -16,6 +16,12 @@ const MODELS: &[&str] = &[
     "claude-opus-4-8",
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
+    // DeepSeek (OpenAI-compatible; needs a DeepSeek API key). `deepseek-chat`/`deepseek-reasoner`
+    // are the stable aliases; the `v4` ids select the newer generation explicitly.
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
     "ollama:llama3.1",
     "ollama:qwen2.5-coder",
     "ollama:mistral-nemo",
@@ -44,6 +50,21 @@ pub async fn settings_set_api_key(state: State<'_, AppState>, key: String) -> Ap
 #[tauri::command]
 pub async fn settings_has_api_key(_state: State<'_, AppState>) -> AppResult<bool> {
     Ok(secrets::get_api_key("anthropic")?
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false))
+}
+
+/// DeepSeek API key (OpenAI-compatible cloud model). Stored in the OS keychain like every other
+/// secret; rebuilds the open workspace so a selected `deepseek-*` model picks it up immediately.
+#[tauri::command]
+pub async fn settings_set_deepseek_key(state: State<'_, AppState>, key: String) -> AppResult<()> {
+    secrets::set_api_key("deepseek", &key)?;
+    rebuild_current(&state)
+}
+
+#[tauri::command]
+pub async fn settings_has_deepseek_key(_state: State<'_, AppState>) -> AppResult<bool> {
+    Ok(secrets::get_api_key("deepseek")?
         .map(|k| !k.trim().is_empty())
         .unwrap_or(false))
 }

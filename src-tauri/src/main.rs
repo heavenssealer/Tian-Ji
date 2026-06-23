@@ -70,6 +70,8 @@ fn main() {
             commands::auth::auth_disconnect,
             commands::settings::settings_set_api_key,
             commands::settings::settings_has_api_key,
+            commands::settings::settings_set_deepseek_key,
+            commands::settings::settings_has_deepseek_key,
             commands::settings::settings_set_sudo_password,
             commands::settings::settings_has_sudo_password,
             commands::settings::settings_list_models,
