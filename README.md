@@ -6,11 +6,18 @@ persistent memory, and a phase-aware UI.
 
 - Architecture & rationale: [`DESIGN.md`](./DESIGN.md)
 - Crate/module map: [`SKELETON.md`](./SKELETON.md)
+- Codebase guide (for contributors / Claude Code): [`CLAUDE.md`](./CLAUDE.md)
 
-> Status: **v0.1 vertical slice — building and functional.** The full loop is wired:
-> workspaces → Claude agent → tiered-approval tool execution → event log → live xterm + streaming
-> chat. `cargo test --workspace` and `cargo check --workspace` pass; the frontend typechecks and
-> builds. To use the agent you need an Anthropic API key (see [API key](#api-key) below).
+> Status: **v0.1.0 — functional, well past the original vertical slice.** The full loop is wired
+> and extended: workspaces → Claude **or local (Ollama)** agent → tiered-approval tool execution
+> → append-only event log → live xterm + streaming chat. Beyond the MVP it now ships
+> **subscription (OAuth) auth** alongside API keys, an **autonomous goal loop**, **sub-agent
+> delegation**, an **attempt/trace log**, **on-demand recall**, **Agent Skills** (CTF playbooks),
+> and an aggressive **token-economy** layer (prompt caching, rolling compaction, output
+> summarization, read-only command dedup, and optional [RTK](#token-economy) compression).
+> `cargo test --workspace` and `cargo check --workspace` pass; the frontend typechecks and builds.
+> To use a cloud agent you need an Anthropic API key **or** a Claude Pro/Max subscription (see
+> [Authentication](#authentication)); local models need no key.
 
 ---
 
@@ -183,12 +190,52 @@ youruser ALL=(ALL) NOPASSWD: /usr/bin/nmap, /usr/bin/masscan, /usr/bin/rustscan,
 > **macOS**: use `sudo visudo` and add the same block. Tool paths may differ
 > (`/opt/homebrew/bin/nmap` etc.) — check with `which nmap`.
 
-## API key
+## Authentication
 
-The agent requires an **Anthropic API key**. Enter it once in the Settings panel (⚙ icon) —
-it is stored in the OS keychain and never written to disk in plaintext.
+A cloud agent authenticates one of two ways, configured in the Settings panel (⚙ icon):
 
-Get a key at [console.anthropic.com](https://console.anthropic.com).
+- **Anthropic subscription (Claude Pro/Max)** — log in via OAuth; turns bill your subscription,
+  exactly like the Claude Code CLI. Takes precedence over an API key when both are present.
+- **Anthropic API key** — billed to your org's API credits. Get one at
+  [console.anthropic.com](https://console.anthropic.com).
+
+Either credential is stored in the OS keychain (Windows Credential Manager / macOS Keychain /
+GNOME Keyring or KDE Wallet) and never written to disk in plaintext. Disconnect the subscription
+to fall back to the API key.
+
+**Local models (no key required):** select an `ollama:<model>` entry in the model picker to run
+fully offline against a local [Ollama](https://ollama.com) instance (`ollama pull <model>` first).
+Sensitive engagements stay on-box. Configure the Ollama host and context window in Settings.
+
+### Model picker
+
+Pick the orchestrator model in Settings — `claude-opus-4-8` (default), `claude-sonnet-4-6`,
+`claude-haiku-4-5`, or any pulled `ollama:` model. Sub-agents never run on Opus: if you pick Opus
+for the orchestrator, delegated sub-agents drop to Sonnet automatically (a major cost lever).
+
+## Token economy
+
+An agent that drives attacker tooling over many rounds burns tokens fast. Several layers keep cost
+bounded (see [`CLAUDE.md`](./CLAUDE.md) for the mechanics):
+
+- **Prompt caching** — the stable system prompt + tool schemas are sent as a cached prefix, so from
+  turn two they bill at ~10% of input price. The volatile context (scope, notes, attempt log) sits
+  after the cache breakpoint.
+- **Rolling compaction** — once a session's history passes 75% of the context budget, the oldest
+  turns are summarized into a dense brief on the cheap (Sonnet/local) model instead of re-sent.
+- **Output summarization + dedup** — large tool output is summarized before it enters context (the
+  raw stays addressable via the `recall` tool); identical read-only commands reuse their prior
+  result instead of re-running.
+- **RTK (Rust Token Killer)** — optional: when the `rtk` binary is installed, output of supported
+  read-only tools (`ls`, `grep`, `git`, `cargo`, …) is compressed 60–90% before it reaches the
+  model. On by default, a silent no-op if `rtk` isn't found.
+- **Cost meter + budget cap** — cumulative token spend is shown per workspace; set a hard cap to
+  stop a runaway run. The autonomous goal loop additionally self-stops at 15 iterations or
+  ~600k tokens.
+
+> Rough order of magnitude: an autonomous **HTB box (user + root) costs ~250k–600k metered tokens
+> ≈ $2–6** on `claude-opus-4-8`, depending on how cleanly it solves. The goal loop's ~600k-token
+> ceiling is the hard stop.
 
 ---
 
