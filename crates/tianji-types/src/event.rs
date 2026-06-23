@@ -46,6 +46,9 @@ pub enum EventKind {
     Note,
     PhaseChange,
     Finding,
+    /// A traced attempt — an approach the agent tried and its outcome. Lets the agent avoid
+    /// re-trying dead ends and gives the operator a reproducible, timestamped trail.
+    Attempt,
 }
 
 /// An immutable fact in the log. Never updated in place — corrections are new events.

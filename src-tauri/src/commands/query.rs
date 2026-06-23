@@ -51,6 +51,7 @@ fn kind_str(k: EventKind) -> &'static str {
         EventKind::Note => "note",
         EventKind::PhaseChange => "phase_change",
         EventKind::Finding => "finding",
+        EventKind::Attempt => "attempt",
     }
 }
 
@@ -81,6 +82,16 @@ pub async fn findings_query(state: State<'_, AppState>) -> AppResult<Vec<Finding
 
 fn display_text(e: &Event) -> String {
     let p = &e.payload;
+    // Traced attempts: "[status] action — result".
+    if let Some(action) = p.get("action").and_then(|v| v.as_str()) {
+        let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("trying");
+        let result = p.get("result").and_then(|v| v.as_str()).unwrap_or("");
+        return if result.is_empty() {
+            format!("[{status}] {action}")
+        } else {
+            format!("[{status}] {action} — {result}")
+        };
+    }
     for key in ["text", "summary", "output", "reason", "phase"] {
         if let Some(s) = p.get(key).and_then(|v| v.as_str()) {
             return s.to_string();

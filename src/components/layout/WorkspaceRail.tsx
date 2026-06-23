@@ -293,18 +293,25 @@ function ScopeEditModal({
   };
 
   return (
-    <Modal title={`Scope — ${workspace.name}`} onClose={onClose}>
+    <Modal
+      title={`Scope — ${workspace.name}`}
+      onClose={onClose}
+      footer={
+        <>
+          {error && <p className="mb-2 text-[11px] text-danger">{error}</p>}
+          <div className="flex justify-end gap-2">
+            <GhostButton onClick={onClose}>Cancel</GhostButton>
+            <PrimaryButton onClick={() => void save()}>Save scope</PrimaryButton>
+          </div>
+        </>
+      }
+    >
       <p className="mb-3 text-[11px] text-ink-faint">
         Targets outside this scope are denied by policy.
       </p>
       <ScopeSection label="CIDRs" placeholder="192.168.1.0/24" items={cidrs} setItems={setCidrs} />
       <ScopeSection label="Hostnames" placeholder="corp.example.com" items={hostnames} setItems={setHostnames} />
       <ScopeSection label="URL domains" placeholder="app.example.com" items={urlDomains} setItems={setUrlDomains} />
-      {error && <p className="mt-2 text-[11px] text-danger">{error}</p>}
-      <div className="mt-4 flex justify-end gap-2">
-        <GhostButton onClick={onClose}>Cancel</GhostButton>
-        <PrimaryButton onClick={() => void save()}>Save scope</PrimaryButton>
-      </div>
     </Modal>
   );
 }
@@ -373,7 +380,19 @@ function RenameModal({
   };
 
   return (
-    <Modal title="Rename workspace" onClose={onClose}>
+    <Modal
+      title="Rename workspace"
+      onClose={onClose}
+      footer={
+        <>
+          {error && <p className="mb-2 text-[11px] text-danger">{error}</p>}
+          <div className="flex justify-end gap-2">
+            <GhostButton onClick={onClose}>Cancel</GhostButton>
+            <PrimaryButton onClick={() => void save()}>Rename</PrimaryButton>
+          </div>
+        </>
+      }
+    >
       <label className="label mb-1 block">Name</label>
       <input
         value={name}
@@ -382,11 +401,6 @@ function RenameModal({
         className={fieldClass}
         onKeyDown={(e) => e.key === "Enter" && void save()}
       />
-      {error && <p className="mt-2 text-[11px] text-danger">{error}</p>}
-      <div className="mt-4 flex justify-end gap-2">
-        <GhostButton onClick={onClose}>Cancel</GhostButton>
-        <PrimaryButton onClick={() => void save()}>Rename</PrimaryButton>
-      </div>
     </Modal>
   );
 }
@@ -401,39 +415,60 @@ function ConfirmDeleteModal({
   onConfirm: () => void;
 }) {
   return (
-    <Modal title="Delete workspace?" onClose={onClose}>
-      <p className="mb-4 text-[12px] text-ink-dim">
+    <Modal
+      title="Delete workspace?"
+      onClose={onClose}
+      footer={
+        <div className="flex justify-end gap-2">
+          <GhostButton onClick={onClose}>Cancel</GhostButton>
+          <button
+            onClick={onConfirm}
+            className="rounded-md bg-danger/80 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-danger"
+          >
+            Delete
+          </button>
+        </div>
+      }
+    >
+      <p className="text-[12px] text-ink-dim">
         Remove <span className="font-semibold text-ink">{workspace.name}</span> from the list?
         The engagement data on disk will not be deleted.
       </p>
-      <div className="flex justify-end gap-2">
-        <GhostButton onClick={onClose}>Cancel</GhostButton>
-        <button
-          onClick={onConfirm}
-          className="rounded-md bg-danger/80 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-danger"
-        >
-          Delete
-        </button>
-      </div>
     </Modal>
   );
 }
 
+// The model picker is per-chat: it shows and sets the ACTIVE chat's model. Changing it rebuilds the
+// backend provider for that model and remembers it on the chat, so other chats keep their own model.
 function ModelSelect() {
   const [models, setModels] = useState<string[]>([]);
-  const [model,  setModel]  = useState("");
+  const activeModel = useAppStore((s) => s.activeModel);
+  const currentSessionId = useAppStore((s) => s.currentSessionId);
+  const setActiveModel = useAppStore((s) => s.setActiveModel);
+  const setSessionModel = useAppStore((s) => s.setSessionModel);
 
   useEffect(() => {
     void ipc.settingsListModels().then(setModels).catch(() => {});
-    void ipc.settingsGetModel().then(setModel).catch(() => {});
+    // Initialize from the persisted (last-used) model once, then track it on the active chat.
+    void ipc.settingsGetModel().then((m) => {
+      if (m) {
+        setActiveModel(m);
+        setSessionModel(currentSessionId, m);
+      }
+    }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const change = async (m: string) => {
-    setModel(m);
-    await ipc.settingsSetModel(m).catch(() => {});
+    setSessionModel(currentSessionId, m); // also updates activeModel (current chat)
+    try {
+      await ipc.settingsSetModel(m);
+      // Rebuilding the provider reset the orchestrator to the default session — re-assert ours.
+      await ipc.agentSwitchSession(currentSessionId);
+    } catch { /* keychain/provider error surfaces on the next turn */ }
   };
 
-  const options = (models.length > 0 ? models : model ? [model] : []).map((m) => ({
+  const options = (models.length > 0 ? models : activeModel ? [activeModel] : []).map((m) => ({
     value: m,
     label: m,
   }));
@@ -443,7 +478,7 @@ function ModelSelect() {
       <div className="flex items-center gap-2">
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent" />
         <Select
-          value={model}
+          value={activeModel}
           options={options}
           onChange={(m) => void change(m)}
           onOpen={() => void ipc.settingsListModels().then(setModels).catch(() => {})}
@@ -487,7 +522,19 @@ function NewWorkspaceModal({
   };
 
   return (
-    <Modal title="New workspace" onClose={onClose}>
+    <Modal
+      title="New workspace"
+      onClose={onClose}
+      footer={
+        <>
+          {error && <p className="mb-2 text-[11px] text-danger">{error}</p>}
+          <div className="flex justify-end gap-2">
+            <GhostButton onClick={onClose}>Cancel</GhostButton>
+            <PrimaryButton onClick={() => void create()}>Create</PrimaryButton>
+          </div>
+        </>
+      }
+    >
       <label className="label mb-1 block">Name</label>
       <input
         value={name}
@@ -506,11 +553,6 @@ function NewWorkspaceModal({
       <p className="mt-1 text-[11px] text-ink-faint">
         Targets outside this scope are denied by policy.
       </p>
-      {error && <p className="mt-2 text-[11px] text-danger">{error}</p>}
-      <div className="mt-4 flex justify-end gap-2">
-        <GhostButton onClick={onClose}>Cancel</GhostButton>
-        <PrimaryButton onClick={() => void create()}>Create</PrimaryButton>
-      </div>
     </Modal>
   );
 }

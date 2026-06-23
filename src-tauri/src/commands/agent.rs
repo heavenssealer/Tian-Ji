@@ -289,6 +289,15 @@ fn emit_update(app: &AppHandle, update: AgentUpdate) {
                 serde_json::json!({ "type": "goal_end", "text": outcome, "input": iterations }),
             );
         }
+        AgentUpdate::Compacted { summarized } => {
+            let _ = app.emit(
+                events::AGENT_DELTA,
+                serde_json::json!({ "type": "compacted", "input": summarized }),
+            );
+        }
+        AgentUpdate::SkillUsed { name } => {
+            let _ = app.emit(events::AGENT_DELTA, serde_json::json!({ "type": "skill_used", "text": name }));
+        }
         AgentUpdate::TurnEnded => {
             let _ = app.emit(events::AGENT_DELTA, serde_json::json!({ "type": "turn_end" }));
         }

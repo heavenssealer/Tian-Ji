@@ -5,6 +5,7 @@ import AgentChat from "../agent/AgentChat";
 import NotesPanel from "../notes/NotesPanel";
 import SettingsButton from "../SettingsButton";
 import Select from "../Select";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useBackendEvents } from "../../lib/backend";
 import { useAppStore } from "../../state/stores";
 import { ipc } from "../../lib/ipc";
@@ -135,8 +136,12 @@ export default function AppShell() {
         <WorkspaceRail />
       </aside>
 
-      {/* Top bar over the main + right columns */}
-      <header className="col-start-2 col-span-2 row-start-1 flex items-center gap-3 border-b border-base-500 px-4">
+      {/* Top bar over the main + right columns. Doubles as the window drag region (the OS title bar
+          is disabled), with custom min/max/close controls on the right. */}
+      <header
+        data-tauri-drag-region
+        className="col-start-2 col-span-2 row-start-1 flex items-center gap-3 border-b border-base-500 px-4"
+      >
         <span className="min-w-0 truncate text-[13px] font-medium text-ink">
           {current ? current.name : "No workspace"}
         </span>
@@ -153,6 +158,7 @@ export default function AppShell() {
           <span className="flex items-center gap-1.5 text-[11px] text-ink-faint">
             <span className="h-1.5 w-1.5 rounded-full bg-ok" /> v0.1
           </span>
+          <WindowControls />
         </div>
       </header>
 
@@ -187,7 +193,10 @@ export default function AppShell() {
 
 function Brand() {
   return (
-    <div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-base-500 px-3">
+    <div
+      data-tauri-drag-region
+      className="flex h-12 shrink-0 items-center gap-2.5 border-b border-base-500 px-3"
+    >
       <div className="flex h-8 w-8 items-center justify-center rounded-md bg-accent/15 font-mono text-[15px] text-accent ring-1 ring-accent/30">
         天
       </div>
@@ -195,6 +204,36 @@ function Brand() {
         <div className="text-[13px] font-medium text-ink">Tiān Jī</div>
         <div className="text-[10px] text-ink-faint">Pentest · AI operator</div>
       </div>
+    </div>
+  );
+}
+
+// Custom window controls (the native title bar is disabled via `decorations: false`).
+function WindowControls() {
+  const run = (fn: (w: ReturnType<typeof getCurrentWindow>) => Promise<unknown>) => () => {
+    try {
+      void fn(getCurrentWindow());
+    } catch {
+      /* not running under Tauri (e.g. browser preview) */
+    }
+  };
+  const btn = "flex h-6 w-6 items-center justify-center rounded text-[13px] text-ink-faint hover:bg-base-600 hover:text-ink";
+  return (
+    <div className="flex items-center gap-0.5">
+      <button className={btn} onClick={run((w) => w.minimize())} title="Minimize" aria-label="Minimize">
+        ‒
+      </button>
+      <button className={btn} onClick={run((w) => w.toggleMaximize())} title="Maximize" aria-label="Maximize">
+        ▢
+      </button>
+      <button
+        className="flex h-6 w-6 items-center justify-center rounded text-[13px] text-ink-faint hover:bg-danger hover:text-white"
+        onClick={run((w) => w.close())}
+        title="Close"
+        aria-label="Close"
+      >
+        ✕
+      </button>
     </div>
   );
 }

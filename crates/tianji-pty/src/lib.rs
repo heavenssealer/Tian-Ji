@@ -60,9 +60,23 @@ impl PtyManager {
             .map_err(|e| PtyError::Io(e.to_string()))?;
 
         let shell = default_shell();
+        let mut cmd = CommandBuilder::new(&shell);
+        // A GUI-launched app (double-clicked .app on macOS, or a Linux desktop launcher) inherits a
+        // minimal environment: no TERM, often a bare PATH and no locale. That makes interactive
+        // programs emit "TERM environment variable not set", disables colour/line-editing, and feels
+        // laggy. Set a sane terminal env, and run the shell as a *login* shell so it sources the
+        // user's profile (restoring PATH, etc.) on Unix.
+        if !cfg!(windows) {
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            cmd.env("LANG", std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string()));
+            // `-l` = login shell: sources /etc/profile + the user's ~/.profile/.zprofile so PATH and
+            // friends are populated even when launched from Finder/a desktop icon.
+            cmd.arg("-l");
+        }
         let child = pair
             .slave
-            .spawn_command(CommandBuilder::new(shell))
+            .spawn_command(cmd)
             .map_err(|e| PtyError::Io(e.to_string()))?;
 
         let mut reader = pair.master.try_clone_reader().map_err(|e| PtyError::Io(e.to_string()))?;

@@ -15,6 +15,70 @@ pub trait CommandRunner: Send + Sync {
     fn run(&self, tool: &str, argv: &[String]) -> String;
 }
 
+/// Tools that are genuine RTK (Rust Token Killer) sub-commands — running them as `rtk <tool> …`
+/// compresses their output 60–90% before it reaches the model. We only wrap this curated set (the
+/// commands RTK actually understands); pentest/network tools run raw and go through our own
+/// summarizer instead. Read-only, so they stay cache-eligible.
+const RTK_TOOLS: &[&str] =
+    &["ls", "grep", "rg", "find", "git", "cat", "head", "tail", "tree", "cargo", "pytest", "jest", "docker"];
+
+/// Resolve the `rtk` binary once per process, returning the path to invoke it by (or `None` if it
+/// isn't installed). A GUI-launched app (Finder/desktop icon) gets a minimal `PATH` that usually
+/// excludes `~/.cargo/bin` and Homebrew, so a `cargo install rtk` / `brew install rtk` wouldn't be
+/// found by name — we probe the common install locations by absolute path as a fallback.
+pub fn detect_rtk() -> Option<String> {
+    use std::sync::OnceLock;
+    // Cache only a *successful* resolution (permanent once found). A negative result is NOT cached,
+    // so installing `rtk` mid-session is picked up on the next call — the negative probe is cheap
+    // (a fast NotFound spawn + a few path-existence checks).
+    static RTK: OnceLock<String> = OnceLock::new();
+    if let Some(p) = RTK.get() {
+        return Some(p.clone());
+    }
+    let resolved = resolve_rtk();
+    if let Some(p) = &resolved {
+        let _ = RTK.set(p.clone());
+    }
+    resolved
+}
+
+fn resolve_rtk() -> Option<String> {
+    let exe = if cfg!(windows) { "rtk.exe" } else { "rtk" };
+
+    // 1) Already reachable by name on the process PATH.
+    if probe_rtk(exe) {
+        return Some(exe.to_string());
+    }
+
+    // 2) Common install dirs that a GUI app's PATH typically omits.
+    let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok();
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(h) = &home {
+        candidates.push(std::path::Path::new(h).join(".cargo").join("bin").join(exe));
+        candidates.push(std::path::Path::new(h).join(".local").join("bin").join(exe));
+    }
+    if !cfg!(windows) {
+        candidates.push("/usr/local/bin/rtk".into());
+        candidates.push("/opt/homebrew/bin/rtk".into());
+        candidates.push("/usr/bin/rtk".into());
+    }
+    candidates
+        .into_iter()
+        .find(|c| c.exists() && probe_rtk(&c.to_string_lossy()))
+        .map(|c| c.to_string_lossy().into_owned())
+}
+
+/// `<bin> --version` succeeds.
+fn probe_rtk(bin: &str) -> bool {
+    std::process::Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Spawns real subprocesses. Holds an optional sudo password so privileged tools can be
 /// elevated without requiring NOPASSWD sudoers configuration, and a shared `cancel` flag so the
 /// operator's Stop button can interrupt a long-running tool (otherwise the async turn would block
@@ -24,21 +88,43 @@ pub struct ProcessRunner {
     /// Shared with the [`Orchestrator`](crate::Orchestrator): set true by `cancel()`. Polled
     /// while a tool runs; when it flips we kill the process group and return promptly.
     cancel: Arc<AtomicBool>,
+    /// Route RTK-supported commands through `rtk` to shrink their output (no-op if `rtk` isn't
+    /// installed). Set from the operator's `use_rtk` setting.
+    use_rtk: bool,
 }
 
 impl ProcessRunner {
     pub fn new() -> Self {
-        Self { sudo_password: None, cancel: Arc::new(AtomicBool::new(false)) }
+        Self { sudo_password: None, cancel: Arc::new(AtomicBool::new(false)), use_rtk: false }
     }
 
     pub fn with_sudo_password(password: Option<String>) -> Self {
-        Self { sudo_password: password, cancel: Arc::new(AtomicBool::new(false)) }
+        Self { sudo_password: password, cancel: Arc::new(AtomicBool::new(false)), use_rtk: false }
     }
 
     /// Share the orchestrator's cancellation flag so Stop can interrupt a running tool.
     pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
         self.cancel = cancel;
         self
+    }
+
+    /// Enable RTK output compression for supported commands (effective only when `rtk` is on PATH).
+    pub fn with_rtk(mut self, enabled: bool) -> Self {
+        self.use_rtk = enabled;
+        self
+    }
+
+    /// Rewrite `(tool, argv)` to `(<rtk>, [tool, ..argv])` when RTK can compress this command.
+    fn rtk_wrap(&self, tool: &str, argv: &[String]) -> (String, Vec<String>) {
+        if self.use_rtk && RTK_TOOLS.contains(&tool) {
+            if let Some(rtk) = detect_rtk() {
+                let mut a = Vec::with_capacity(argv.len() + 1);
+                a.push(tool.to_string());
+                a.extend_from_slice(argv);
+                return (rtk, a);
+            }
+        }
+        (tool.to_string(), argv.to_vec())
     }
 }
 
@@ -48,8 +134,9 @@ impl Default for ProcessRunner {
 
 impl CommandRunner for ProcessRunner {
     fn run(&self, tool: &str, argv: &[String]) -> String {
-        let tool_s = tool.to_string();
-        let argv_s = argv.to_vec();
+        // Execution may be rewritten to `rtk <tool> …`; messages, timeout and elevation still key
+        // off the original tool name.
+        let (tool_s, argv_s) = self.rtk_wrap(tool, argv);
         let password = self.sudo_password.clone();
         let elevated = is_elevated_tool(tool);
 
@@ -282,5 +369,26 @@ fn kill_process_group(pid: Option<u32>, _elevated: bool, _sudo_password: Option<
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtk_wrap_is_noop_when_disabled() {
+        let r = ProcessRunner::new(); // use_rtk = false
+        let (tool, argv) = r.rtk_wrap("grep", &["-r".into(), "flag".into()]);
+        assert_eq!(tool, "grep");
+        assert_eq!(argv, vec!["-r".to_string(), "flag".to_string()]);
+    }
+
+    #[test]
+    fn rtk_wrap_leaves_unsupported_tools_alone() {
+        // Even enabled, a non-RTK tool (nmap) is never rewritten.
+        let r = ProcessRunner::new().with_rtk(true);
+        let (tool, _) = r.rtk_wrap("nmap", &["-sV".into()]);
+        assert_eq!(tool, "nmap");
     }
 }

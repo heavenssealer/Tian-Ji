@@ -6,10 +6,13 @@ export default function Modal({
   title,
   onClose,
   children,
+  footer,
 }: {
   title: string;
   onClose: () => void;
   children: ReactNode;
+  /** Pinned to the bottom of the modal; stays visible while the body scrolls. */
+  footer?: ReactNode;
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -21,20 +24,26 @@ export default function Modal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      // Padding on the overlay keeps the modal off the viewport edges; `max-h-full` on the panel
+      // then caps it to that area so a tall form (e.g. Settings) never overflows a short window —
+      // the body scrolls instead, and on a small window the modal effectively fills the screen.
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-3 backdrop-blur-sm sm:p-4"
       onClick={onClose}
     >
       <div
-        className="w-[420px] max-w-[92vw] rounded-card border border-base-500 bg-base-700 shadow-2xl"
+        className="flex max-h-full w-[420px] max-w-[92vw] flex-col rounded-card border border-base-500 bg-base-700 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between border-b border-base-500 px-4 py-3">
+        <div className="flex shrink-0 items-center justify-between border-b border-base-500 px-4 py-3">
           <h2 className="text-[13px] font-medium text-ink">{title}</h2>
           <button onClick={onClose} className="text-ink-faint hover:text-ink" aria-label="Close">
             ✕
           </button>
         </div>
-        <div className="p-4">{children}</div>
+        <div className="min-h-0 overflow-y-auto p-4">{children}</div>
+        {footer && (
+          <div className="shrink-0 border-t border-base-500 p-4">{footer}</div>
+        )}
       </div>
     </div>
   );

@@ -122,3 +122,59 @@ pub async fn settings_set_ollama_num_ctx(state: State<'_, AppState>, num_ctx: u3
     state.app.set_setting("ollama_num_ctx", &n.to_string())?;
     rebuild_current(&state)
 }
+
+/// RTK (Rust Token Killer) status: whether the operator enabled it, and whether the `rtk` binary is
+/// actually reachable (resolved by name or via common install dirs). "Active" = enabled && found.
+#[derive(serde::Serialize)]
+pub struct RtkStatus {
+    pub enabled: bool,
+    pub available: bool,
+    pub path: Option<String>,
+}
+
+#[tauri::command]
+pub async fn settings_get_rtk(state: State<'_, AppState>) -> AppResult<RtkStatus> {
+    let enabled = state
+        .app
+        .get_setting("use_rtk")
+        .ok()
+        .flatten()
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    let path = tianji_agent::detect_rtk();
+    Ok(RtkStatus { enabled, available: path.is_some(), path })
+}
+
+/// Enable/disable RTK output compression. Rebuilds the open workspace so the runner picks it up.
+#[tauri::command]
+pub async fn settings_set_rtk(state: State<'_, AppState>, enabled: bool) -> AppResult<()> {
+    state.app.set_setting("use_rtk", if enabled { "true" } else { "false" })?;
+    rebuild_current(&state)
+}
+
+/// Installed Agent Skills the agents can use (discovered from the configured skill directories).
+#[derive(serde::Serialize)]
+pub struct SkillsStatus {
+    pub count: usize,
+    pub names: Vec<String>,
+    pub dirs: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn settings_get_skills(state: State<'_, AppState>) -> AppResult<SkillsStatus> {
+    let dirs = crate::state::skill_dirs(&state.app);
+    let catalog = tianji_agent::SkillCatalog::discover(&dirs);
+    Ok(SkillsStatus {
+        count: catalog.len(),
+        names: catalog.skills().iter().map(|s| s.name.clone()).collect(),
+        dirs: dirs.iter().map(|d| d.display().to_string()).collect(),
+    })
+}
+
+/// Point skill discovery at a custom directory (empty resets to the defaults). Rebuilds the open
+/// workspace so the agents pick up the new catalog.
+#[tauri::command]
+pub async fn settings_set_skills_dir(state: State<'_, AppState>, dir: String) -> AppResult<()> {
+    state.app.set_setting("skills_dir", dir.trim())?;
+    rebuild_current(&state)
+}

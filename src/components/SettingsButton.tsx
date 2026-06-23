@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../lib/ipc";
+import type { RtkStatus, SkillsStatus } from "../lib/types";
 import Modal, { fieldClass, GhostButton, PrimaryButton } from "./Modal";
 
 export default function SettingsButton() {
@@ -13,6 +14,9 @@ export default function SettingsButton() {
   const [sudoPw, setSudoPw] = useState("");
   const [ollamaHost, setOllamaHost] = useState("");
   const [numCtx, setNumCtx] = useState(16384);
+  const [rtk, setRtk] = useState<RtkStatus | null>(null);
+  const [skills, setSkills] = useState<SkillsStatus | null>(null);
+  const [skillsDir, setSkillsDir] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -22,6 +26,33 @@ export default function SettingsButton() {
     ipc.settingsHasSudoPassword().then(setHasSudo).catch(() => {});
     ipc.settingsGetOllamaHost().then(setOllamaHost).catch(() => {});
     ipc.settingsGetOllamaNumCtx().then(setNumCtx).catch(() => {});
+    ipc.settingsGetRtk().then(setRtk).catch(() => {});
+    ipc.settingsGetSkills().then(setSkills).catch(() => {});
+  };
+
+  // Apply the (optional) custom dir AND rebuild the agent so newly-installed skills take effect.
+  const applySkills = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.settingsSetSkillsDir(skillsDir.trim());
+      await ipc.settingsGetSkills().then(setSkills);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleRtk = async (enabled: boolean) => {
+    setRtk((r) => (r ? { ...r, enabled } : r)); // optimistic
+    try {
+      await ipc.settingsSetRtk(enabled);
+      await ipc.settingsGetRtk().then(setRtk);
+    } catch (e) {
+      setError(String(e));
+      void ipc.settingsGetRtk().then(setRtk).catch(() => {});
+    }
   };
 
   useEffect(() => { refresh(); }, []);
@@ -109,7 +140,19 @@ export default function SettingsButton() {
       </button>
 
       {open && (
-        <Modal title="Settings" onClose={() => setOpen(false)}>
+        <Modal
+          title="Settings"
+          onClose={() => setOpen(false)}
+          footer={
+            <>
+              {error && <p className="mb-2 text-[11px] text-danger">{error}</p>}
+              <div className="flex justify-end gap-2">
+                <GhostButton onClick={() => setOpen(false)}>Cancel</GhostButton>
+                <PrimaryButton onClick={() => void save()}>{busy ? "Saving…" : "Save"}</PrimaryButton>
+              </div>
+            </>
+          }
+        >
           <p className="mb-4 text-[11px] text-ink-faint">
             All secrets are stored in the OS keychain — never written to disk.
           </p>
@@ -235,12 +278,84 @@ export default function SettingsButton() {
             </p>
           </div>
 
-          {error && <p className="mb-2 text-[11px] text-danger">{error}</p>}
-
-          <div className="mt-4 flex justify-end gap-2">
-            <GhostButton onClick={() => setOpen(false)}>Cancel</GhostButton>
-            <PrimaryButton onClick={() => void save()}>{busy ? "Saving…" : "Save"}</PrimaryButton>
+          <div className="mb-4 rounded-md border border-base-600 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <label className="text-[11px] font-medium text-ink-dim">
+                RTK output compression{" "}
+                <span className="font-normal text-ink-faint">(Rust Token Killer — shrinks output of ls/grep/git/find/…)</span>
+              </label>
+              <button
+                role="switch"
+                aria-checked={rtk?.enabled ?? true}
+                onClick={() => void toggleRtk(!(rtk?.enabled ?? true))}
+                className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
+                  rtk?.enabled ?? true ? "bg-accent" : "bg-base-500"
+                }`}
+                title="Toggle RTK"
+              >
+                <span
+                  className={`absolute top-0.5 h-4 w-4 rounded-full bg-base-900 transition-all ${
+                    rtk?.enabled ?? true ? "left-[18px]" : "left-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+            <p className="mt-1.5 text-[11px]">
+              {rtk?.enabled && rtk?.available && (
+                <span className="text-ok">● Active — wrapping supported commands via <code>{rtk.path}</code>.</span>
+              )}
+              {rtk?.enabled && rtk && !rtk.available && (
+                <span className="text-warn">
+                  ● Enabled, but <code>rtk</code> isn't installed. Run <code>cargo install rtk</code> (or <code>brew install rtk</code>), then reopen Settings.
+                </span>
+              )}
+              {rtk && !rtk.enabled && <span className="text-ink-faint">○ Disabled — commands run uncompressed.</span>}
+            </p>
           </div>
+
+          <div className="mb-4 rounded-md border border-base-600 p-3">
+            <div className="mb-1.5 flex items-center justify-between gap-2">
+              <label className="text-[11px] font-medium text-ink-dim">
+                Agent skills{" "}
+                <span className="font-normal text-ink-faint">(playbooks the agents can load on demand — cloud & local)</span>
+              </label>
+              <span className={`shrink-0 text-[11px] ${skills && skills.count > 0 ? "text-ok" : "text-ink-faint"}`}>
+                {skills ? `${skills.count} loaded` : "…"}
+              </span>
+            </div>
+
+            {skills && skills.count > 0 && (
+              <div className="mb-2 flex flex-wrap gap-1">
+                {skills.names.map((n) => (
+                  <span key={n} className="rounded bg-base-700 px-1.5 py-0.5 font-mono text-[10px] text-ink-dim">
+                    {n}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            <p className="mb-2 text-[11px] text-ink-faint">
+              Install in the terminal, then Apply:
+              {" "}<code>npx skills add ljagiello/ctf-skills</code>{" "}and{" "}
+              <code>bash scripts/install_ctf_tools.sh all</code> (installs the tools).
+              {skills?.dirs?.length ? (
+                <> Searched: <span className="font-mono text-[10px]">{skills.dirs.join(", ")}</span>.</>
+              ) : null}
+            </p>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={skillsDir}
+                onChange={(e) => setSkillsDir(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && void applySkills()}
+                placeholder="custom skills dir (optional — leave blank for defaults)"
+                className={`${fieldClass} text-[11px]`}
+              />
+              <GhostButton onClick={() => void applySkills()}>{busy ? "…" : "Apply / rescan"}</GhostButton>
+            </div>
+          </div>
+
         </Modal>
       )}
     </>

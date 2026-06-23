@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { ActiveAgent, AgentDelta, ChatSession, Phase, ProposedCall, WorkspaceInfo } from "../lib/types";
 
 export interface ChatLine {
-  kind: "user" | "agent" | "tool" | "error" | "finding";
+  kind: "user" | "agent" | "tool" | "error" | "finding" | "info";
   text: string;
 }
 
@@ -32,6 +32,8 @@ interface AppUiState {
   tokenBudget: number;
   totalTokens: TokenCount;
   activeAgents: ActiveAgent[];
+  // The model the backend provider is currently built for (mirrors the active chat's model).
+  activeModel: string;
 
   setWorkspaces: (w: WorkspaceInfo[]) => void;
   setCurrentWorkspace: (id: string | null) => void;
@@ -39,6 +41,8 @@ interface AppUiState {
   // Session actions
   newSession: () => ChatSession;
   switchSession: (id: string) => void;
+  setActiveModel: (m: string) => void;
+  setSessionModel: (id: string, model: string) => void;
   // Chat actions (operate on current session)
   setChat: (lines: ChatLine[]) => void;
   pushChat: (line: ChatLine) => void;
@@ -70,6 +74,7 @@ export const useAppStore = create<AppUiState>((set, get) => ({
   tokenBudget: 0,
   totalTokens: { input: 0, output: 0 },
   activeAgents: [{ name: "orchestrator", status: "idle" }],
+  activeModel: "",
 
   setWorkspaces: (workspaces) => set({ workspaces }),
 
@@ -96,7 +101,9 @@ export const useAppStore = create<AppUiState>((set, get) => ({
 
   newSession: () => {
     sessionCounter += 1;
-    const session: ChatSession = { id: `session-${Date.now()}`, name: `Chat ${sessionCounter}` };
+    // Inherit the current chat's model so a new chat starts on the same model unless changed.
+    const model = get().activeModel || undefined;
+    const session: ChatSession = { id: `session-${Date.now()}`, name: `Chat ${sessionCounter}`, model };
     set((s) => ({
       sessions: [...s.sessions, session],
       currentSessionId: session.id,
@@ -111,6 +118,14 @@ export const useAppStore = create<AppUiState>((set, get) => ({
     const lines = get().sessionLines[id] ?? [];
     set({ currentSessionId: id, chat: lines, isRunning: false });
   },
+
+  setActiveModel: (activeModel) => set({ activeModel }),
+
+  setSessionModel: (id, model) =>
+    set((s) => ({
+      activeModel: id === s.currentSessionId ? model : s.activeModel,
+      sessions: s.sessions.map((sess) => (sess.id === id ? { ...sess, model } : sess)),
+    })),
 
   setChat: (lines) =>
     set((s) => ({
@@ -160,6 +175,18 @@ export const useAppStore = create<AppUiState>((set, get) => ({
           return updateChat([...s.chat, { kind: "error", text: `⊘ Denied: ${d.text ?? ""}` }]);
         case "finding":
           return updateChat([...s.chat, { kind: "finding", text: d.text ?? "" }]);
+        case "compacted": {
+          const n = d.input ?? 0;
+          return updateChat([
+            ...s.chat,
+            { kind: "info", text: `🗜 Compacted ${n} earlier message${n === 1 ? "" : "s"} into a summary to save tokens. Full raw output stays in the event log.` },
+          ]);
+        }
+        case "skill_used":
+          return updateChat([
+            ...s.chat,
+            { kind: "info", text: `🧩 Using skill: ${d.text ?? ""}` },
+          ]);
         case "error":
           return updateChat([...s.chat, { kind: "error", text: d.text ?? "" }]);
         case "token_usage":

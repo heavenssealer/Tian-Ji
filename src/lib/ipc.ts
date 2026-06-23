@@ -2,7 +2,7 @@
 // One function per #[tauri::command]; keep names in lockstep with src-tauri/src/commands/.
 
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalResolution, EventDto, FindingDto, Phase, PolicyRuleDto, ProfileFact, ProfileScope, WorkspaceInfo } from "./types";
+import type { ApprovalResolution, EventDto, FindingDto, Phase, PolicyRuleDto, ProfileFact, ProfileScope, RtkStatus, SkillsStatus, WorkspaceInfo } from "./types";
 
 export const ipc = {
   workspaceList: () => invoke<WorkspaceInfo[]>("workspace_list"),
@@ -63,4 +63,8 @@ export const ipc = {
   settingsSetOllamaHost: (host: string) => invoke<void>("settings_set_ollama_host", { host }),
   settingsGetOllamaNumCtx: () => invoke<number>("settings_get_ollama_num_ctx"),
   settingsSetOllamaNumCtx: (numCtx: number) => invoke<void>("settings_set_ollama_num_ctx", { numCtx }),
+  settingsGetRtk: () => invoke<RtkStatus>("settings_get_rtk"),
+  settingsSetRtk: (enabled: boolean) => invoke<void>("settings_set_rtk", { enabled }),
+  settingsGetSkills: () => invoke<SkillsStatus>("settings_get_skills"),
+  settingsSetSkillsDir: (dir: string) => invoke<void>("settings_set_skills_dir", { dir }),
 };

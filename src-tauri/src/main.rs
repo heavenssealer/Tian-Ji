@@ -79,6 +79,10 @@ fn main() {
             commands::settings::settings_set_ollama_host,
             commands::settings::settings_get_ollama_num_ctx,
             commands::settings::settings_set_ollama_num_ctx,
+            commands::settings::settings_get_rtk,
+            commands::settings::settings_set_rtk,
+            commands::settings::settings_get_skills,
+            commands::settings::settings_set_skills_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tiān Jī");

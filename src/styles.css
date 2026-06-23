@@ -32,6 +32,13 @@
     background: #3a3a40;
     background-clip: padding-box;
   }
+
+  /* xterm hard-codes `overflow-y: scroll` on its viewport, so the terminal ALWAYS shows a
+     scrollbar — even with an empty buffer. Stacked above the notes pane that reads as a redundant
+     second scrollbar. Switch it to `auto` so it only appears when there's real scrollback. */
+  .xterm .xterm-viewport {
+    overflow-y: auto;
+  }
 }
 
 @layer components {

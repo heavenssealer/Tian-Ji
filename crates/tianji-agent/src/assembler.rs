@@ -90,6 +90,39 @@ impl ContextAssembler {
         out
     }
 
+    /// Total token estimate for a set of messages (same chars/4 heuristic as the per-turn budgeter).
+    pub fn estimate_tokens(messages: &[Message]) -> usize {
+        messages.iter().map(message_tokens).sum()
+    }
+
+    /// Pick where to cut conversation HISTORY (which has NO leading system message) for compaction:
+    /// returns `split` such that `messages[..split]` should be summarized away and `messages[split..]`
+    /// kept verbatim. Keeps the newest messages that fit in `keep_budget`, then anchors the kept
+    /// window to a user turn so no `tool_result` is orphaned. Returns 0 when nothing needs compacting.
+    pub fn compaction_split(messages: &[Message], keep_budget: usize) -> usize {
+        if messages.is_empty() {
+            return 0;
+        }
+        let mut remaining = keep_budget;
+        let mut start = messages.len();
+        for i in (0..messages.len()).rev() {
+            let cost = message_tokens(&messages[i]);
+            if cost > remaining {
+                break;
+            }
+            remaining -= cost;
+            start = i;
+        }
+        if start == 0 {
+            return 0;
+        }
+        // Anchor so the kept suffix begins on a user turn (history may start on a user at index 0).
+        if let Some(i) = (start..messages.len()).find(|&i| messages[i].role == Role::User) {
+            return i;
+        }
+        (0..start).rev().find(|&i| messages[i].role == Role::User).unwrap_or(messages.len())
+    }
+
     /// Cap tool output in-place to prevent individual messages from dominating the context.
     pub fn cap_tool_output(messages: &mut Vec<Message>) {
         Self::cap_tool_output_with(messages, TOOL_OUTPUT_CAP);
@@ -107,7 +140,10 @@ impl ContextAssembler {
                             // Respect UTF-8 boundaries — `output` may contain multibyte chars.
                             let end = (0..=cap).rev().find(|&i| output.is_char_boundary(i)).unwrap_or(0);
                             *output = format!(
-                                "{}…\n[truncated — {} total chars]",
+                                "{}…\n[truncated — {} total chars. The FULL output is saved in the \
+                                 event log: call recall with a keyword from this command/output to \
+                                 read the rest. Do NOT re-run this command or page it with \
+                                 sed/head/tail line ranges.]",
                                 &output[..end],
                                 output.len()
                             );
@@ -235,6 +271,31 @@ mod tests {
         let out = ContextAssembler { max_tokens: 20 }.trim_to_budget(&messages);
         assert!(out.len() < messages.len(), "trimming should have engaged");
         assert_valid(&out);
+    }
+
+    #[test]
+    fn compaction_split_keeps_recent_and_anchors_to_user() {
+        let pad = "padding ".repeat(40);
+        // History (no system message): three user/assistant/tool triplets.
+        let history = vec![
+            user(&format!("q1 {pad}")),
+            assistant_tool("toolu_A"),
+            tool_result("toolu_A"),
+            user(&format!("q2 {pad}")),
+            assistant_tool("toolu_B"),
+            tool_result("toolu_B"),
+            user("q3 recent"),
+        ];
+        // Small keep budget forces most of it into the "summarize" half.
+        let split = ContextAssembler::compaction_split(&history, 20);
+        assert!(split > 0, "compaction should engage");
+        assert_eq!(history[split].role, Role::User, "kept suffix must start on a user turn");
+    }
+
+    #[test]
+    fn compaction_split_returns_zero_when_everything_fits() {
+        let history = vec![user("hi"), assistant_tool("toolu_A"), tool_result("toolu_A")];
+        assert_eq!(ContextAssembler::compaction_split(&history, 100_000), 0);
     }
 
     #[test]

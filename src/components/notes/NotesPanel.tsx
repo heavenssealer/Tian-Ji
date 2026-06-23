@@ -7,7 +7,7 @@ import NotesEditorModal from "./NotesEditorModal";
 import ReportModal from "./ReportModal";
 import Select from "../Select";
 
-const AUTO_KINDS = new Set(["tool_output", "finding", "agent_msg", "phase_change", "tool_denied"]);
+const AUTO_KINDS = new Set(["tool_output", "finding", "agent_msg", "phase_change", "tool_denied", "attempt"]);
 
 const SEV_STYLE: Record<string, string> = {
   critical: "bg-danger/20 text-danger ring-danger/30",
@@ -154,7 +154,7 @@ export default function NotesPanel() {
         </div>
       )}
       {tab === "auto" && (
-        <ul className="flex-1 space-y-0.5 overflow-auto p-2 text-ink-dim">
+        <ul className="flex-1 space-y-0.5 overflow-y-auto overflow-x-hidden p-2 text-ink-dim">
           {autoNotes.length === 0 && <li className="text-ink-faint">{phaseFilter ? `nothing in ${phaseFilter} phase` : "nothing yet"}</li>}
           {autoNotes.map((e) => (
             <li key={e.id} className="group flex items-start gap-1.5 border-l-2 border-base-500 pl-2">
@@ -177,7 +177,7 @@ export default function NotesPanel() {
 
       {tab === "notebook" && (
         <div className="flex flex-1 flex-col overflow-hidden p-2">
-          <ul className="mb-2 min-h-0 flex-1 space-y-1 overflow-auto text-ink-dim">
+          <ul className="mb-2 min-h-0 flex-1 space-y-1 overflow-y-auto overflow-x-hidden text-ink-dim">
             {notebook.length === 0 && <li className="text-ink-faint">no notes yet</li>}
             {notebook.map((e) => (
               <li key={e.id} className="group flex items-start gap-1.5 border-l-2 border-accent/40 pl-2">
@@ -211,7 +211,7 @@ export default function NotesPanel() {
       )}
 
       {tab === "findings" && (
-        <ul className="flex-1 space-y-1 overflow-auto p-2">
+        <ul className="flex-1 space-y-1 overflow-y-auto overflow-x-hidden p-2">
           {findings.length === 0 && (
             <li className="text-ink-faint">no findings yet — the agent logs them automatically</li>
           )}
@@ -257,7 +257,7 @@ export default function NotesPanel() {
             </button>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-auto p-2">
+          <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-2">
             <FactGroup
               label="Operator habits (global)"
               empty="no global habits learned yet"

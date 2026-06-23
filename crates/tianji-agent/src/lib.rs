@@ -25,6 +25,7 @@ use tianji_types::{
     Phase, Role, ScopeRules, ToolCall, WorkspaceId,
 };
 
+mod skills;
 mod approval;
 mod assembler;
 mod mcp;
@@ -34,7 +35,8 @@ mod summary;
 pub use approval::{ApprovalGate, ApprovalOutcome, ApprovalToken, ProposedCall};
 pub use assembler::ContextAssembler;
 pub use mcp::McpHost;
-pub use runner::{CommandRunner, ProcessRunner};
+pub use runner::{detect_rtk, CommandRunner, ProcessRunner};
+pub use skills::{Skill, SkillCatalog};
 
 /// Hard cap on tool-use rounds per orchestrator prompt.
 const MAX_ROUNDS: usize = 8;
@@ -54,6 +56,16 @@ const LOOP_LIMIT: usize = 3;
 /// How many recent events the profile distiller reviews, and the minimum needed to bother.
 const DISTILL_EVENT_SCAN: usize = 60;
 const DISTILL_MIN_EVENTS: usize = 4;
+/// Compaction (rolling summary): once the stored history exceeds `COMPACT_TRIGGER_PCT`% of the
+/// context budget, summarize the oldest turns into a compact brief and keep only the newest
+/// `COMPACT_KEEP_PCT`% verbatim. This is how a long agentic run stays cheap — instead of re-sending
+/// (and re-billing) an ever-growing transcript every turn, old turns collapse to a dense summary.
+const COMPACT_TRIGGER_PCT: usize = 75;
+const COMPACT_KEEP_PCT: usize = 40;
+/// `recall` tool: how many matching events to return and the per-event char cap, so an on-demand
+/// recall can't itself blow the window (the agent narrows its query if it needs more).
+const RECALL_HITS: usize = 4;
+const RECALL_CHARS_PER_HIT: usize = 2_500;
 /// Sentinels the model emits to end the goal loop. Kept distinctive so they don't appear by
 /// accident in ordinary prose.
 const GOAL_DONE_TOKEN: &str = "[[GOAL_COMPLETE]]";
@@ -113,6 +125,10 @@ pub enum AgentUpdate {
     GoalIteration { iteration: u32 },
     /// The goal loop ended; `outcome` is a [`GoalOutcome`] label.
     GoalFinished { outcome: String, iterations: u32 },
+    /// Old turns were rolled up into a summary; `summarized` is how many messages collapsed.
+    Compacted { summarized: usize },
+    /// The agent loaded an installed skill via `use_skill`.
+    SkillUsed { name: String },
     TurnEnded,
     Error(String),
 }
@@ -163,6 +179,9 @@ pub struct Orchestrator {
     /// Switches the system prompt to a terse variant, bounds notes/profile harder, tightens the
     /// tool-output cap, and tells the agent not to delegate (sub-agents multiply context).
     small_context: bool,
+    /// Installed Agent Skills (CTF playbooks etc.). Catalog goes into the prompt; the `use_skill`
+    /// tool loads full instructions on demand. Available to cloud and local agents alike.
+    skills: SkillCatalog,
 }
 
 impl Orchestrator {
@@ -188,7 +207,14 @@ impl Orchestrator {
             global_facts: std::sync::Mutex::new(Vec::new()),
             context_budget: 16_000,
             small_context: false,
+            skills: SkillCatalog::empty(),
         }
+    }
+
+    /// Install the discovered Agent Skills catalog (cloud + local agents share it).
+    pub fn with_skills(mut self, skills: SkillCatalog) -> Self {
+        self.skills = skills;
+        self
     }
 
     /// Replace the cached global habits (called at build time from the app store and after each
@@ -210,9 +236,11 @@ impl Orchestrator {
         self
     }
 
-    /// Per-turn tool-output cap — tighter when the model's window is tiny.
+    /// Per-turn tool-output cap — tighter when the model's window is tiny. Tool results are the
+    /// bulkiest thing in the re-sent history, so keeping this modest directly cuts per-message cost
+    /// (the raw output is still in the event log if the operator needs it).
     fn tool_output_cap(&self) -> usize {
-        if self.small_context { 768 } else { 2_048 }
+        if self.small_context { 768 } else { 1_400 }
     }
 
     fn assembler(&self) -> ContextAssembler {
@@ -508,6 +536,104 @@ impl Orchestrator {
         global
     }
 
+    fn compact_trigger(&self) -> usize {
+        self.context_budget.saturating_mul(COMPACT_TRIGGER_PCT) / 100
+    }
+    fn compact_keep(&self) -> usize {
+        self.context_budget.saturating_mul(COMPACT_KEEP_PCT) / 100
+    }
+
+    /// If this session's stored history has grown past the trigger, summarize its oldest turns into a
+    /// dense brief and keep only the recent tail verbatim — the core "don't re-send an ever-growing
+    /// transcript" optimization. Runs on the (cheap) sub-agent model; never holds the history lock
+    /// across the await; and leaves the history untouched if summarization fails.
+    async fn maybe_compact(
+        &self,
+        store: &WorkspaceStore,
+        session_id: &str,
+        updates: &UnboundedSender<AgentUpdate>,
+    ) {
+        let (old, suffix): (Vec<Message>, Vec<Message>) = {
+            let histories = self.histories.lock().unwrap();
+            let Some(history) = histories.get(session_id) else { return };
+            if ContextAssembler::estimate_tokens(history) <= self.compact_trigger() {
+                return;
+            }
+            let split = ContextAssembler::compaction_split(history, self.compact_keep());
+            if split == 0 {
+                return;
+            }
+            (history[..split].to_vec(), history[split..].to_vec())
+        };
+        if old.is_empty() {
+            return;
+        }
+
+        let summary = self.summarize_transcript(&old).await;
+        if summary.trim().is_empty() {
+            return; // summarization failed/cancelled — keep the original history intact
+        }
+
+        let header = format!(
+            "[Condensed summary of {} earlier messages in this engagement — preserved facts only]\n{}\n\
+             [End of summary; recent activity continues below.]",
+            old.len(),
+            summary.trim()
+        );
+
+        // Merge the summary into the first kept message when it's a user turn (keeps roles valid and
+        // tool-use/result pairs intact — the kept suffix begins on a user turn by construction).
+        let mut suffix = suffix;
+        let starts_with_user = suffix.first().map(|m| m.role == Role::User).unwrap_or(false);
+        let mut new_history: Vec<Message> = Vec::with_capacity(suffix.len() + 1);
+        if starts_with_user {
+            let first = suffix.remove(0);
+            let existing = collect_text(&first.content);
+            let merged = if existing.is_empty() { header } else { format!("{header}\n\n{existing}") };
+            new_history.push(Message { role: Role::User, content: vec![text(merged)] });
+        } else {
+            new_history.push(Message { role: Role::User, content: vec![text(header)] });
+        }
+        new_history.extend(suffix);
+
+        {
+            let mut histories = self.histories.lock().unwrap();
+            histories.insert(session_id.to_string(), new_history.clone());
+        }
+        if let Ok(json) = serde_json::to_string(&new_history) {
+            let _ = store.save_conversation(session_id, &json);
+        }
+        let _ = updates.send(AgentUpdate::Compacted { summarized: old.len() });
+    }
+
+    /// One-shot summarization of an old transcript slice on the sub-agent model (no tools).
+    async fn summarize_transcript(&self, old: &[Message]) -> String {
+        let messages = vec![
+            Message { role: Role::System, content: vec![text(COMPACT_SYSTEM.to_string())] },
+            Message {
+                role: Role::User,
+                content: vec![text(format!("Transcript to compact:\n{}", transcript_for_summary(old)))],
+            },
+        ];
+        let trimmed = self.assembler().trim_to_budget(&messages);
+        let Ok(mut stream) = self.subagent_provider.run_turn(&trimmed, &[]).await else {
+            return String::new();
+        };
+        let mut out = String::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::TextDelta { text } => out.push_str(&text),
+                AgentEvent::TokensUsed { input_tokens, output_tokens } => {
+                    self.tokens_spent
+                        .fetch_add(input_tokens as u64 + output_tokens as u64, Ordering::SeqCst);
+                }
+                AgentEvent::TurnEnd => break,
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// One prompt-cycle: build context → run tool-rounds → persist. Unlike [`handle_prompt`] this
     /// does NOT reset the cancel flag, so the standalone goal loop can keep a Stop latched across
     /// iterations (otherwise each new cycle would clear it and ignore the operator's Stop).
@@ -522,6 +648,13 @@ impl Orchestrator {
         let rules = store.allow_rules()?;
         let phase = store.current_phase()?;
         let notes = store.notes(20).unwrap_or_default();
+        let attempts = store.attempts(24).unwrap_or_default();
+        let findings = store.findings().unwrap_or_default();
+        let machine = is_machine_engagement(&scope);
+        // CTF triage playbook only applies to jeopardy-style challenges; on a machine it's dead
+        // weight (~2k cached tokens) and the kill-chain/privesc methodology takes its place.
+        let solve_section =
+            if machine { String::new() } else { self.skills.preloaded_system_section(self.small_context) };
 
         store.append(Event::new(
             ws,
@@ -534,6 +667,8 @@ impl Orchestrator {
 
         // Load this session's history. Clone to avoid holding the lock across awaits.
         let session_id = self.active_session.lock().unwrap().clone();
+        // Roll up old turns into a summary before they cost us another full re-send.
+        self.maybe_compact(store, &session_id, &updates).await;
         let history_before_len;
         let mut messages = {
             let mut histories = self.histories.lock().unwrap();
@@ -541,7 +676,11 @@ impl Orchestrator {
             history_before_len = history.len();
             // System prompt is rebuilt fresh each turn (scope/phase/notes may have changed).
             let mut msgs = vec![
-                Message { role: Role::System, content: vec![text(system_prompt(phase, &scope, &notes, self.free_mode.load(Ordering::SeqCst), &self.profile_for(store), self.small_context))] },
+                Message { role: Role::System, content: vec![
+                    // Block 1 (cached): stable instructions. Block 2 (uncached): volatile context.
+                    text(stable_system_prompt(self.small_context, self.free_mode.load(Ordering::SeqCst), &self.skills.catalog_text(), &solve_section, machine)),
+                    text(volatile_context(phase, &scope, &notes, &self.profile_for(store), &attempts, &findings, self.small_context)),
+                ] },
             ];
             msgs.extend(history.clone());
             msgs
@@ -628,6 +767,13 @@ impl Orchestrator {
                 }
                 let context_output = if call.name == "record_finding" {
                     self.handle_record_finding(store, &updates, ws, phase, &call)?
+                } else if call.name == "log_attempt" {
+                    self.handle_log_attempt(store, ws, phase, &call)?
+                } else if call.name == "recall" {
+                    // Returns full stored text on purpose — do NOT route through the summarizer.
+                    self.handle_recall(store, &call)
+                } else if call.name == "use_skill" {
+                    self.handle_use_skill(&updates, store, ws, phase, &call)
                 } else if call.name == "delegate_to_agent" {
                     self.run_subagent(store, &updates, ws, phase, &call).await?
                 } else {
@@ -718,6 +864,11 @@ impl Orchestrator {
         let scope = store.scope()?;
         let rules = store.allow_rules()?;
         let notes = store.notes(10).unwrap_or_default();
+        let attempts = store.attempts(16).unwrap_or_default();
+        let findings = store.findings().unwrap_or_default();
+        let machine = is_machine_engagement(&scope);
+        let solve_section =
+            if machine { String::new() } else { self.skills.preloaded_system_section(self.small_context) };
 
         // Keyword recall: surface events relevant to the objective so the sub-agent doesn't
         // repeat work the orchestrator or a prior agent already did.
@@ -732,17 +883,19 @@ impl Orchestrator {
             )
         };
 
-        let sys = format!(
-            "{}{recalled_hint}",
-            system_prompt(
-                subagent_phase, &scope, &notes,
-                self.free_mode.load(Ordering::SeqCst), &self.profile_for(store), self.small_context,
-            )
-        );
-
+        // Sub-agents run on the cheaper model where prompt caching matters less, so keep the system
+        // prompt as one block (stable instructions + volatile context + recall).
+        let free = self.free_mode.load(Ordering::SeqCst);
         let mut messages = vec![
-            Message { role: Role::System, content: vec![text(sys)] },
-            Message { role: Role::User,   content: vec![text(objective.clone())] },
+            Message {
+                role: Role::System,
+                content: vec![text(format!(
+                    "{}\n{}{recalled_hint}",
+                    stable_system_prompt(self.small_context, free, &self.skills.catalog_text(), &solve_section, machine),
+                    volatile_context(subagent_phase, &scope, &notes, &self.profile_for(store), &attempts, &findings, self.small_context),
+                ))],
+            },
+            Message { role: Role::User, content: vec![text(objective.clone())] },
         ];
 
         let assembler = self.assembler();
@@ -823,6 +976,20 @@ impl Orchestrator {
                         severity, target, summary: summary.clone(),
                     });
                     format!("Finding recorded: {summary}")
+                } else if tc.name == "log_attempt" {
+                    let action = tc.arguments["action"].as_str().unwrap_or("").to_string();
+                    let status = tc.arguments["status"].as_str().unwrap_or("trying").to_string();
+                    let result = tc.arguments["result"].as_str().unwrap_or("").to_string();
+                    store.append(Event::new(
+                        ws, subagent_phase, EventKind::Attempt,
+                        subagent_actor.clone(), Author::Agent,
+                        json!({ "action": action, "status": status, "result": result }),
+                    ))?;
+                    format!("Attempt logged: [{status}] {action}")
+                } else if tc.name == "recall" {
+                    self.handle_recall(store, &tc)
+                } else if tc.name == "use_skill" {
+                    self.handle_use_skill(&updates, store, ws, subagent_phase, &tc)
                 } else {
                     // All other calls go through the same policy engine, but with the sub-agent's actor.
                     let (tool, argv) = parse_run_command(&tc);
@@ -920,7 +1087,7 @@ impl Orchestrator {
                 };
                 // Summarize large command output before it enters the sub-agent's context (raw
                 // output is already in the event log). Finding/denial strings are already compact.
-                let context_out = if tc.name == "record_finding" {
+                let context_out = if matches!(tc.name.as_str(), "record_finding" | "log_attempt" | "recall" | "use_skill") {
                     out
                 } else {
                     let (tool, _) = parse_run_command(&tc);
@@ -1077,6 +1244,22 @@ impl Orchestrator {
         let target = call.arguments["target"].as_str().unwrap_or("").to_string();
         let summary = call.arguments["summary"].as_str().unwrap_or("").to_string();
 
+        // Dedup safety net: the model tends to re-log the same issue across turns under slightly
+        // different target strings ("…:443/https" vs "…:443/tcp"). If an existing finding is on the
+        // same normalized host:port AND its summary is substantially the same, skip it rather than
+        // flooding the report — and tell the agent it's already recorded.
+        if let Ok(existing) = store.findings() {
+            if existing.iter().any(|f| {
+                norm_target(&f.target) == norm_target(&target)
+                    && summary_overlap(&f.summary, &summary) >= 0.6
+            }) {
+                return Ok(format!(
+                    "Already recorded a finding for {target} (\"{}\") — not duplicating. Move on.",
+                    trunc(&summary, 80)
+                ));
+            }
+        }
+
         store.append(Event::new(
             ws,
             phase,
@@ -1093,6 +1276,122 @@ impl Orchestrator {
         });
 
         Ok(format!("Finding recorded: [{severity}] {target} — {summary}"))
+    }
+
+    /// Append a traced attempt (status = trying/succeeded/failed/abandoned). The event log is the
+    /// source of truth; recent attempts are fed back into the system prompt so the agent stops
+    /// re-trying dead ends.
+    /// Append a traced attempt. We deliberately do NOT push it as a chat `Text` update (that would
+    /// concatenate onto the in-flight agent bubble); it surfaces in the Auto/Trace tab and the
+    /// event log, and is fed back into the next system prompt via the attempt log.
+    fn handle_log_attempt(
+        &self,
+        store: &WorkspaceStore,
+        ws: WorkspaceId,
+        phase: Phase,
+        call: &ToolCall,
+    ) -> Result<String> {
+        let action = call.arguments["action"].as_str().unwrap_or("").to_string();
+        let status = call.arguments["status"].as_str().unwrap_or("trying").to_string();
+        let result = call.arguments["result"].as_str().unwrap_or("").to_string();
+
+        store.append(Event::new(
+            ws,
+            phase,
+            EventKind::Attempt,
+            self.actor.clone(),
+            Author::Agent,
+            json!({ "action": action, "status": status, "result": result }),
+        ))?;
+
+        Ok(format!("Attempt logged: [{status}] {action}"))
+    }
+
+    /// `recall` tool: pull the FULL stored text of matching events back into context on demand, so a
+    /// detail dropped by summarization/compaction isn't lost. Bounded by hit count + per-hit chars.
+    fn handle_recall(&self, store: &WorkspaceStore, call: &ToolCall) -> String {
+        let query = call.arguments["query"].as_str().unwrap_or("").trim().to_string();
+        if query.is_empty() {
+            return "recall: provide a non-empty `query` — a keyword that appears in what you want (an IP, port, path, tool name, CVE).".to_string();
+        }
+        let hits = store.search_events(&query, RECALL_HITS).unwrap_or_default();
+        if hits.is_empty() {
+            return format!(
+                "recall: nothing in the engagement log matches \"{query}\". Try a different keyword (IP, port, path, tool name)."
+            );
+        }
+        let mut out = format!("Full recall for \"{query}\" — {} match(es), newest first:", hits.len());
+        for e in &hits {
+            out.push_str(&format!(
+                "\n\n=== [{}] ===\n{}",
+                recall_kind_label(e.kind),
+                trunc(&full_event_text(e), RECALL_CHARS_PER_HIT)
+            ));
+        }
+        out
+    }
+
+    /// `use_skill` tool: load a named skill's full instructions on demand (progressive disclosure).
+    fn handle_use_skill(
+        &self,
+        updates: &UnboundedSender<AgentUpdate>,
+        store: &WorkspaceStore,
+        ws: WorkspaceId,
+        phase: Phase,
+        call: &ToolCall,
+    ) -> String {
+        let name = call.arguments["name"].as_str().unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            return "use_skill: provide the `name` of a skill from the catalog in your system prompt.".to_string();
+        }
+        // Second-level disclosure: a specific technique file within the skill.
+        let file = call.arguments["file"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
+
+        let loaded = match file {
+            Some(f) => self.skills.load_file(&name, f),
+            None => self.skills.load(&name),
+        };
+        match loaded {
+            Some(body) => {
+                // Surface it so the operator sees which skill the agent pulled in.
+                let shown = match file {
+                    Some(f) => format!("{name}/{f}"),
+                    None => name.clone(),
+                };
+                // Log it so the operator can verify skill usage after the fact (Auto tab / report).
+                let _ = store.append(Event::new(
+                    ws,
+                    phase,
+                    EventKind::AgentMsg,
+                    self.actor.clone(),
+                    Author::Agent,
+                    json!({ "text": format!("Loaded skill: {shown}") }),
+                ));
+                let _ = updates.send(AgentUpdate::SkillUsed { name: shown });
+                body
+            }
+            None => {
+                if let Some(f) = file {
+                    return format!(
+                        "use_skill: skill \"{name}\" has no file \"{f}\" (or it couldn't be read). \
+                         Call use_skill name=\"{name}\" (no file) first to see its bundled-files list, \
+                         then pass an exact name from it."
+                    );
+                }
+                let available = self
+                    .skills
+                    .skills()
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if available.is_empty() {
+                    "use_skill: no skills are installed. (Operator: install with `npx skills add …`.)".to_string()
+                } else {
+                    format!("use_skill: no skill named \"{name}\". Available: {available}.")
+                }
+            }
+        }
     }
 
     fn record_denied(
@@ -1131,6 +1430,40 @@ fn collect_text(content: &[Content]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Render an event's stored payload as full text for the `recall` tool (no summarization).
+fn full_event_text(e: &Event) -> String {
+    let p = &e.payload;
+    if let Some(output) = p.get("output").and_then(|v| v.as_str()) {
+        let tool = p.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+        return if tool.is_empty() { output.to_string() } else { format!("$ {tool}\n{output}") };
+    }
+    if let Some(summary) = p.get("summary").and_then(|v| v.as_str()) {
+        let sev = p.get("severity").and_then(|v| v.as_str()).unwrap_or("");
+        let target = p.get("target").and_then(|v| v.as_str()).unwrap_or("");
+        return format!("{sev} {target} {summary}").trim().to_string();
+    }
+    if let Some(text) = p.get("text").and_then(|v| v.as_str()) {
+        return text.to_string();
+    }
+    if let Some(action) = p.get("action").and_then(|v| v.as_str()) {
+        let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let result = p.get("result").and_then(|v| v.as_str()).unwrap_or("");
+        return format!("[{status}] {action} {result}").trim().to_string();
+    }
+    p.to_string()
+}
+
+fn recall_kind_label(k: EventKind) -> &'static str {
+    match k {
+        EventKind::ToolOutput => "tool output",
+        EventKind::Finding => "finding",
+        EventKind::Note => "note",
+        EventKind::AgentMsg => "agent note",
+        EventKind::Attempt => "attempt",
+        _ => "event",
+    }
 }
 
 /// Extract `(tool, argv)` from a `run_command` tool call. `argv` excludes the tool name.
@@ -1181,6 +1514,37 @@ fn needs_shell(tool: &str, argv: &[String]) -> bool {
             || a.contains("$(")
             || a.contains('`')
     })
+}
+
+const COMPACT_SYSTEM: &str = "You are compacting a penetration-testing session transcript to free \
+up context space. Produce a DENSE factual brief (bullet points, not prose) preserving EVERYTHING \
+needed to continue the engagement: target hosts with open ports/services/versions; discovered \
+endpoints, paths, parameters; credentials, tokens, hashes and flags VERBATIM; confirmed findings \
+and how they were verified; approaches already TRIED and their outcome (succeeded/failed/abandoned) \
+so they are not repeated; and the current access/foothold plus the next logical step. Keep exact \
+values (IPs, ports, paths, creds). Omit chit-chat and raw tool noise. Be terse.";
+
+/// Render an old transcript slice into a compact plaintext form for the summarizer.
+fn transcript_for_summary(msgs: &[Message]) -> String {
+    let mut s = String::new();
+    for m in msgs {
+        let role = match m.role {
+            Role::User => "USER",
+            Role::Assistant => "ASSISTANT",
+            Role::Tool => "TOOL",
+            Role::System => "SYSTEM",
+        };
+        for c in &m.content {
+            match c {
+                Content::Text { text } => s.push_str(&format!("{role}: {}\n", trunc(text, 600))),
+                Content::ToolUse { call } => {
+                    s.push_str(&format!("{role} ran {}: {}\n", call.name, trunc(&call.arguments.to_string(), 200)))
+                }
+                Content::ToolResult { output, .. } => s.push_str(&format!("RESULT: {}\n", trunc(output, 500))),
+            }
+        }
+    }
+    s
 }
 
 const DISTILL_SYSTEM: &str = "You maintain a durable profile of a penetration tester you assist. \
@@ -1269,6 +1633,33 @@ fn goal_prompt(goal: &str, first: bool) -> String {
     }
 }
 
+/// Normalize a finding target to `host:port` so trivial suffix differences ("/https", "/tcp",
+/// "/admin") don't read as distinct targets when deduping.
+fn norm_target(t: &str) -> String {
+    let head = t.split_whitespace().next().unwrap_or(t); // drop trailing " — description"
+    let base = head.split('/').next().unwrap_or(head); // drop "/https", "/admin/…"
+    base.trim().to_lowercase()
+}
+
+/// Rough word-overlap (Jaccard over lowercased word sets) between two finding summaries, ignoring
+/// short stop-ish tokens. 1.0 = identical wording, 0.0 = nothing in common.
+fn summary_overlap(a: &str, b: &str) -> f32 {
+    let words = |s: &str| -> std::collections::HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 3)
+            .map(|w| w.to_string())
+            .collect()
+    };
+    let (wa, wb) = (words(a), words(b));
+    if wa.is_empty() || wb.is_empty() {
+        return if a.trim().eq_ignore_ascii_case(b.trim()) { 1.0 } else { 0.0 };
+    }
+    let inter = wa.intersection(&wb).count() as f32;
+    let union = wa.union(&wb).count() as f32;
+    if union == 0.0 { 0.0 } else { inter / union }
+}
+
 /// Truncate to at most `n` chars (char-safe), appending an ellipsis when cut.
 fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() > n {
@@ -1278,73 +1669,60 @@ fn trunc(s: &str, n: usize) -> String {
     }
 }
 
-/// Build the per-turn system prompt. `slim` switches to the terse, hard-bounded variant used when
-/// the model has a tiny window (small-context mode); it trims the instruction prose, caps the
-/// notebook/profile far harder, and tells the agent not to delegate (sub-agents multiply context).
+/// The per-turn system prompt is split into two blocks so Anthropic prompt caching actually works:
 ///
-/// Bounding notes/profile matters even on cloud: they are re-sent every turn and would otherwise
-/// grow without limit, taxing both cost and the cache-write size.
-fn system_prompt(
-    phase: Phase,
-    scope: &ScopeRules,
-    notes: &[tianji_types::Event],
-    free_mode: bool,
-    profile: &[String],
-    slim: bool,
-) -> String {
-    // Caps: (max notes, note chars, max facts, fact chars).
-    let (note_max, note_len, fact_max, fact_len) =
-        if slim { (5usize, 140usize, 6usize, 140usize) } else { (12, 240, 24, 240) };
+/// - [`stable_system_prompt`] — instructions + OS/install policy. Changes only with mode flags, so
+///   it's byte-identical across turns and is sent as the CACHED prefix (tools cache with it).
+/// - [`volatile_context`] — scope, notes, profile, attempt log, phase. Changes most turns, so it's
+///   sent as a SEPARATE, UNcached block. Baking this into the cached prefix (as it used to be) made
+///   the cache miss every turn and re-billed the whole prefix as fresh input — the ~10k floor.
+///
+/// `slim` (small-context mode) trims the prose and caps the volatile lists far harder.
+/// Machine engagement = there's a network host target in scope → drive the full kill chain
+/// (recon → foothold → loot → privesc → root). Otherwise it's a jeopardy-style challenge
+/// (file / single web service) and the CTF triage playbook applies instead.
+fn is_machine_engagement(scope: &ScopeRules) -> bool {
+    !scope.cidrs.is_empty()
+}
 
-    let phase_hint = match phase {
-        Phase::Recon => "You are in the RECON phase: enumerate hosts/services with read-only tools.",
-        Phase::Hypothesis => "You are in the HYPOTHESIS phase: reason about likely weaknesses.",
-        Phase::Poc => "You are in the PoC phase: build minimal proofs of concept.",
-        Phase::Exploit => "You are in the EXPLOIT phase: act carefully; destructive actions need approval.",
-        Phase::Report => "You are in the REPORT phase: summarize findings and evidence.",
-    };
+/// Compact, always-cached methodology for machine engagements. Replaces the (irrelevant) CTF
+/// triage playbook on a box and — crucially — supplies the privilege-escalation checklist that the
+/// CTF skills don't cover. Cheap (~250 tok) and cached, so it costs once per session.
+fn machine_methodology(slim: bool) -> String {
+    if slim {
+        return "\n MACHINE: run the FULL chain — recon → foothold (known CVE for the exact \
+                version / default-weak creds / web exploit) → grab the user flag → harvest creds \
+                (configs, keys, history; TEST every password for reuse via su/ssh) → PRIVESC: \
+                sudo -n -l, SUID `find / -perm -4000 -type f 2>/dev/null`, `getcap -r / 2>/dev/null`, \
+                root cron/writable scripts, readable secrets, and files a ROOT process reads that \
+                YOU can write (configs, hook/spool dirs, signature/whitelist files), else a \
+                kernel/service exploit for the exact version. Confirm uid=0, then record root.txt. \
+                Build on the Confirmed/Attempt log below — don't re-enumerate."
+            .to_string();
+    }
+    "\n\n## MACHINE ENGAGEMENT — run the FULL kill chain, do NOT stop at a foothold:\n\
+     1) RECON: one full port scan per host; identify each service and its exact version.\n\
+     2) FOOTHOLD: get code-exec/shell — a known CVE for the exact version, default/weak creds, or a \
+     web exploit (for web, call use_skill(\"ctf-web\") and follow its technique file).\n\
+     3) LOOT: grab the user flag, then from the shell harvest credentials — app/db/service config \
+     files, history, SSH keys — and TEST every password for reuse (su/ssh to other users).\n\
+     4) PRIVESC TO ROOT — work this checklist in order, log_attempt each step before moving on:\n\
+     • sudo -n -l (GTFOBins for any allowed binary)\n\
+     • SUID/SGID: find / -perm -4000 -type f 2>/dev/null (GTFOBins)\n\
+     • capabilities: getcap -r / 2>/dev/null\n\
+     • cron jobs and writable scripts/PATH run by root\n\
+     • readable secrets: config files, private keys, DB creds, /etc/shadow — then reuse them\n\
+     • files writable by you that a ROOT process reads or executes (configs, hook/spool dirs, \
+     signature/whitelist files) — the highest-value, box-specific path; read the consumer's source \
+     ONCE with grep to find the exact check, don't page it\n\
+     • a known local-exploit for the exact kernel/service version found\n\
+     Confirm root (id shows uid=0), then read and record_finding root.txt.\n\
+     Build on what's already in your Confirmed-findings and Attempt log below — do NOT re-scan or \
+     re-read anything you've already covered."
+        .to_string()
+}
 
-    let mut scope_entries = scope.cidrs.clone();
-    scope_entries.extend(scope.hostnames.clone());
-    scope_entries.extend(scope.url_domains.clone());
-    let scope_hint = if scope_entries.is_empty() {
-        "No engagement scope is defined yet — ask the operator for the target before running any tools.".to_string()
-    } else {
-        format!("Engagement scope: {}.", scope_entries.join(", "))
-    };
-
-    // Notes arrive oldest-first; keep the most recent `note_max` (the tail) and bound each line.
-    let note_texts: Vec<&str> =
-        notes.iter().filter_map(|e| e.payload.get("text").and_then(|v| v.as_str())).collect();
-    let note_start = note_texts.len().saturating_sub(note_max);
-    let notes_hint = if note_texts.is_empty() {
-        String::new()
-    } else {
-        let lines = note_texts[note_start..]
-            .iter()
-            .map(|t| format!("- {}", trunc(t, note_len)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(" Operator notebook:\n{lines}")
-    };
-
-    // Distilled profile — the operator's habits + what we know about this engagement. Bounded so a
-    // long-lived profile can't dominate the window.
-    let profile_hint = if profile.is_empty() {
-        String::new()
-    } else {
-        let lines = profile
-            .iter()
-            .take(fact_max)
-            .map(|f| format!("- {}", trunc(f, fact_len)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            " What you've learned about this operator and engagement (apply it proactively, but \
-             the operator's explicit instructions always win):\n{lines}"
-        )
-    };
-
+fn stable_system_prompt(slim: bool, free_mode: bool, skills_catalog: &str, solve_challenge: &str, machine: bool) -> String {
     // Tell the model the operator OS so it picks the right command syntax. Slim mode uses a one-line
     // form to save tokens.
     let os_hint = match (slim, cfg!(windows)) {
@@ -1392,48 +1770,176 @@ fn system_prompt(
         // Terse core — every token counts on an 8k-ish window.
         return format!(
             "You are an assistant to an authorized penetration tester. \
-             {scope_hint}{notes_hint}{profile_hint} \
              Use run_command to run tools (tool name = the bare executable like \"nmap\"; \
              pipes/redirects need tool=\"bash\", argv=[\"-c\", \"<full line>\"]). \
-             The moment you find an open port, vulnerable service, misconfiguration or any security \
-             issue, call record_finding (severity critical/high/medium/low/info, target like \
-             1.2.3.4:22/ssh, one-line summary). \
+             TRACE YOUR WORK: before starting an exploit/credential/path attempt call log_attempt \
+             (status=trying); after seeing the result call it again (succeeded/failed/abandoned + \
+             one-line result). Check the attempt log and NEVER redo a failed/abandoned path. \
+             record_finding is ONLY for confirmed results and milestones — a captured flag, a \
+             working shell/RCE, valid creds, a verified vuln (put the proof in the summary). Do NOT \
+             log routine enumeration as findings. \
+             If a detail was summarized away or compacted out of context, use the recall tool to \
+             fetch the full original output before assuming it's lost. \
              BE EXTREMELY TERSE: a few words of reasoning at most — no narration, no restating \
              output, no plans. Spend tokens on tool calls and findings, not prose. \
              Do NOT delegate to sub-agents — do the work inline (delegation multiplies context and \
              won't fit this window). \
-             Never re-run a scan whose output is already above; read the earlier result. One port \
-             scan per host. Stay strictly within scope — never touch hosts outside it. \
-             {os_hint} {install_hint} {phase_hint}"
+             Never re-run a scan whose output is already in context; read the earlier result. One \
+             port scan per host. To inspect a file, grep for what you need rather than dumping it \
+             whole; if a result was truncated, call recall — never re-page it with sed ranges. \
+             Stay strictly within scope — never touch hosts outside it. \
+             {os_hint} {install_hint}{skills_catalog}{solve_challenge}{machine_block}",
+            machine_block = if machine { machine_methodology(true) } else { String::new() }
         );
     }
 
     format!(
         "You are an assistant to an authorized penetration tester. \
-         {scope_hint}{notes_hint}{profile_hint} \
          Use the run_command tool to run system tools. \
-         When you discover an open port, vulnerable service, misconfiguration, or any \
-         noteworthy security issue, call record_finding immediately with severity \
-         (critical/high/medium/low/info), the affected target (e.g. 192.168.1.25:22/ssh), \
-         and a concise one-line summary. \
+         TRACE YOUR WORK: before you start an exploit / credential-guess / attack path, call \
+         log_attempt with status=\"trying\" and a one-line `action`; once you see the outcome, call \
+         it again with status succeeded/failed/abandoned and a one-line `result`. Consult the \
+         attempt log and NEVER repeat an approach already marked failed or abandoned — that \
+         is the #1 source of wasted tokens. \
+         record_finding the INSTANT you reach a milestone — ABOVE ALL, a captured flag: the moment \
+         you read user.txt / root.txt or see any `HTB{{...}}` / `flag{{...}}`, call record_finding with \
+         severity critical and the flag value in the summary (this is the goal — never just print a \
+         flag without recording it). Also record a working shell/RCE (with the command/URL), valid \
+         credentials (the pair), and each confirmed vulnerability. ONE finding per distinct issue — \
+         near-duplicates are auto-rejected, so log confirmed results freely rather than hoarding \
+         them; routine version banners alone aren't findings. \
+         If a detail was summarized away or compacted out of context, use the recall tool to fetch \
+         the full original output (by keyword) before assuming it's lost. \
          BE TERSE: reason internally in as few words as possible — a sentence or two, never \
          paragraphs. Do NOT narrate your plan, restate command output back to the operator, or \
          write long commentary. Spend tokens on tool calls and findings, not prose. \
-         STRATEGY: when work splits into independent streams (different hosts, or recon vs. web \
-         vs. exploit on the same target), delegate those streams to sub-agents via \
-         delegate_to_agent and let them run in parallel rather than doing everything yourself in \
-         one long serial loop. Delegation is the DEFAULT for separable work — efficiency rule (2) \
-         is about scoping each sub-agent tightly, NOT about avoiding delegation. \
+         WORK INLINE — sub-agents are NOT free and NOT parallel here: each delegate_to_agent reloads \
+         the ENTIRE system prompt + tools and runs to completion before you continue, so delegating \
+         multiplies token cost for zero speed gain. Do recon, web, and exploit yourself in one loop. \
+         Only delegate when there is a genuinely separate target (e.g. a second host) you would \
+         otherwise ignore — NEVER to split phases on a single box. \
          EFFICIENCY (critical — wasted commands cost time and tokens): \
          (1) Do NOT re-run a scan or request whose output is already in the conversation — read \
          the earlier result instead. One full nmap port scan per host is enough; never repeat it. \
-         (2) Before delegating, check what is already known; give sub-agents a NARROW objective and \
-         tell them to build on existing results, not redo recon. \
-         (3) Pipes/redirects need a shell: use tool=\"bash\", argv=[\"-c\", \"<full line>\"]. \
-         (4) The tool name is the bare executable (e.g. \"nmap\"), never \"run_command\". \
+         (2) Pipes/redirects need a shell: use tool=\"bash\", argv=[\"-c\", \"<full line>\"]. \
+         (3) The tool name is the bare executable (e.g. \"nmap\"), never \"run_command\". \
+         (4) To read a file, grep for the part you need (e.g. grep -n -A5 'keyword' file) instead of \
+         dumping the whole thing; if a tool result came back truncated, call recall to fetch the \
+         full text — do NOT re-run the command or page it with sed/head/tail line ranges (that is a \
+         top source of wasted tokens). \
          Stay strictly within the engagement scope — never target hosts outside it. \
-         {os_hint} {install_hint} {phase_hint}"
+         {os_hint} {install_hint}{skills_catalog}{solve_challenge}{machine_block}",
+        machine_block = if machine { machine_methodology(false) } else { String::new() }
     )
+}
+
+/// The volatile half of the system prompt: engagement scope, operator notebook, distilled profile,
+/// the attempt log, and the current phase. Changes most turns → sent UNcached (after the cache
+/// breakpoint). Empty when there's nothing to say, which keeps the cached prefix the only system
+/// content on a fresh engagement.
+fn volatile_context(
+    phase: Phase,
+    scope: &ScopeRules,
+    notes: &[tianji_types::Event],
+    profile: &[String],
+    attempts: &[tianji_types::Event],
+    findings: &[tianji_types::Finding],
+    slim: bool,
+) -> String {
+    // Caps: (max notes, note chars, max facts, fact chars, max attempts, max findings). Kept tight —
+    // this block is re-sent every turn, so every line here is a recurring tax.
+    let (note_max, note_len, fact_max, fact_len, attempt_max, finding_max) =
+        if slim { (4usize, 140usize, 5usize, 140usize, 6usize, 5usize) } else { (6, 160, 8, 160, 8, 7) };
+
+    let phase_hint = match phase {
+        Phase::Recon => "Phase: RECON — enumerate hosts/services with read-only tools.",
+        Phase::Hypothesis => "Phase: HYPOTHESIS — reason about likely weaknesses.",
+        Phase::Poc => "Phase: PoC — build minimal proofs of concept.",
+        Phase::Exploit => "Phase: EXPLOIT — act carefully; destructive actions need approval.",
+        Phase::Report => "Phase: REPORT — summarize findings and evidence.",
+    };
+
+    let mut scope_entries = scope.cidrs.clone();
+    scope_entries.extend(scope.hostnames.clone());
+    scope_entries.extend(scope.url_domains.clone());
+    let scope_hint = if scope_entries.is_empty() {
+        "No engagement scope is defined yet — ask the operator for the target before running any tools.".to_string()
+    } else {
+        format!("Engagement scope: {}.", scope_entries.join(", "))
+    };
+
+    // Notes arrive oldest-first; keep the most recent `note_max` (the tail) and bound each line.
+    let note_texts: Vec<&str> =
+        notes.iter().filter_map(|e| e.payload.get("text").and_then(|v| v.as_str())).collect();
+    let note_start = note_texts.len().saturating_sub(note_max);
+    let notes_hint = if note_texts.is_empty() {
+        String::new()
+    } else {
+        let lines = note_texts[note_start..]
+            .iter()
+            .map(|t| format!("- {}", trunc(t, note_len)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(" Operator notebook:\n{lines}")
+    };
+
+    // Distilled profile — bounded so a long-lived profile can't dominate the window.
+    let profile_hint = if profile.is_empty() {
+        String::new()
+    } else {
+        let lines = profile
+            .iter()
+            .take(fact_max)
+            .map(|f| format!("- {}", trunc(f, fact_len)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(" Learned about this operator/engagement (apply proactively; explicit instructions win):\n{lines}")
+    };
+
+    // Attempt log — `attempts` arrives newest-first; show the most recent in chronological order.
+    let attempts_hint = if attempts.is_empty() {
+        String::new()
+    } else {
+        let mut recent: Vec<&tianji_types::Event> = attempts.iter().take(attempt_max).collect();
+        recent.reverse();
+        let lines = recent
+            .iter()
+            .filter_map(|e| {
+                let p = &e.payload;
+                let action = p.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                if action.is_empty() {
+                    return None;
+                }
+                let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("trying");
+                let result = p.get("result").and_then(|v| v.as_str()).unwrap_or("");
+                Some(if result.is_empty() {
+                    format!("- [{status}] {}", trunc(action, 110))
+                } else {
+                    format!("- [{status}] {} → {}", trunc(action, 110), trunc(result, 110))
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(" Attempt log — already tried (do NOT repeat failed/abandoned; build on succeeded):\n{lines}")
+    };
+
+    // Confirmed findings — authoritative milestones already captured. Surfacing them stops the
+    // agent from re-deriving what it already proved (e.g. re-finding a flag) when a standalone run
+    // resumes after "keep going".
+    let findings_hint = if findings.is_empty() {
+        String::new()
+    } else {
+        let mut recent: Vec<&tianji_types::Finding> = findings.iter().rev().take(finding_max).collect();
+        recent.reverse();
+        let lines = recent
+            .iter()
+            .map(|f| format!("- [{}] {}: {}", f.severity, trunc(&f.target, 60), trunc(&f.summary, 130)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(" Confirmed so far (authoritative — do NOT re-derive or re-enumerate these):\n{lines}")
+    };
+
+    format!("{scope_hint}{notes_hint}{profile_hint}{findings_hint}{attempts_hint} {phase_hint}")
 }
 
 #[cfg(test)]
@@ -1478,41 +1984,93 @@ mod tests {
 
     #[test]
     fn open_mode_lets_the_agent_install_tools() {
-        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], true, &[], false);
+        let p = stable_system_prompt(false, true, "", "", false);
         assert!(p.contains("OPEN MODE"));
         assert!(p.to_lowercase().contains("install it yourself"));
     }
 
     #[test]
     fn controlled_mode_forbids_install_and_advises_operator() {
-        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[], false);
+        let p = stable_system_prompt(false, false, "", "", false);
         assert!(p.contains("CONTROLLED MODE"));
         assert!(p.contains("must NOT install"));
     }
 
     #[test]
-    fn prompt_makes_delegation_the_default() {
-        let p = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[], false);
+    fn prompt_discourages_delegation_for_single_target() {
+        let p = stable_system_prompt(false, false, "", "", false);
         assert!(p.contains("delegate_to_agent"));
-        assert!(p.contains("DEFAULT for separable work"));
+        assert!(p.contains("WORK INLINE"));
+        assert!(!p.contains("DEFAULT for separable work"));
     }
 
     #[test]
     fn slim_prompt_is_smaller_and_forbids_delegation() {
-        let full = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[], false);
-        let slim = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &[], true);
+        let full = stable_system_prompt(false, false, "", "", false);
+        let slim = stable_system_prompt(true, false, "", "", false);
         assert!(slim.len() < full.len(), "slim prompt should be shorter");
         assert!(slim.contains("Do NOT delegate"), "slim must forbid delegation");
         assert!(!slim.contains("DEFAULT for separable work"));
     }
 
     #[test]
-    fn slim_prompt_bounds_the_profile() {
+    fn machine_mode_injects_privesc_methodology_not_ctf_playbook() {
+        let ctf_playbook = "## MANDATORY CTF PLAYBOOK";
+        // Machine engagement: methodology + privesc checklist, and the CTF playbook is gated off
+        // (the caller passes solve_challenge="" for machines).
+        let machine = stable_system_prompt(false, false, "", "", true);
+        assert!(machine.contains("MACHINE ENGAGEMENT"), "machine methodology present");
+        assert!(machine.contains("PRIVESC TO ROOT"), "privesc checklist present");
+        assert!(machine.contains("perm -4000"), "SUID step present");
+        assert!(!machine.contains(ctf_playbook), "CTF playbook must be gated off on a machine");
+        // Challenge engagement: no machine methodology block.
+        let challenge = stable_system_prompt(false, false, "", ctf_playbook, false);
+        assert!(!challenge.contains("MACHINE ENGAGEMENT"), "no machine block for a challenge");
+        assert!(challenge.contains(ctf_playbook), "CTF playbook present for a challenge");
+    }
+
+    #[test]
+    fn machine_detection_keys_on_network_target() {
+        let mut s = ScopeRules::default();
+        assert!(!is_machine_engagement(&s), "empty scope is not a machine");
+        s.url_domains.push("chal.ctf.io".into());
+        assert!(!is_machine_engagement(&s), "a web challenge URL alone is not a machine");
+        s.cidrs.push("10.129.48.177".into());
+        assert!(is_machine_engagement(&s), "a host/IP target means machine mode");
+    }
+
+    #[test]
+    fn confirmed_findings_surface_in_volatile_context() {
+        let f = tianji_types::Finding {
+            id: tianji_types::EventId::new(),
+            workspace_id: tianji_types::WorkspaceId::new(),
+            severity: "high".into(),
+            target: "10.129.48.177".into(),
+            summary: "user.txt captured: deadbeef".into(),
+            evidence_event_ids: vec![],
+        };
+        let v = volatile_context(Phase::Exploit, &ScopeRules::default(), &[], &[], &[], &[f], false);
+        assert!(v.contains("Confirmed so far"), "findings header present");
+        assert!(v.contains("user.txt captured"), "finding summary surfaced");
+    }
+
+    #[test]
+    fn volatile_block_excludes_the_stable_instructions() {
+        // The volatile context must NOT carry the big instruction prose (that lives in the cached
+        // block) — otherwise the split wouldn't reduce per-turn tokens.
+        let v = volatile_context(Phase::Recon, &ScopeRules::default(), &[], &[], &[], &[], false);
+        assert!(!v.contains("delegate_to_agent"));
+        assert!(!v.contains("OPEN MODE") && !v.contains("CONTROLLED MODE"));
+        assert!(v.contains("Phase: RECON"));
+    }
+
+    #[test]
+    fn volatile_context_bounds_the_profile() {
         let facts: Vec<String> = (0..50).map(|i| format!("habit number {i}")).collect();
-        let slim = system_prompt(Phase::Recon, &ScopeRules::default(), &[], false, &facts, true);
-        // Only the first 6 facts survive the slim cap.
-        assert!(slim.contains("habit number 5"));
-        assert!(!slim.contains("habit number 6"));
+        let v = volatile_context(Phase::Recon, &ScopeRules::default(), &[], &facts, &[], &[], false);
+        // Only the first 8 facts survive the normal cap.
+        assert!(v.contains("habit number 7"));
+        assert!(!v.contains("habit number 8"));
     }
 
     /// A scripted provider: each `run_turn` returns the next pre-baked round of events.
@@ -1669,16 +2227,17 @@ mod tests {
 
     #[test]
     fn profile_facts_are_injected() {
-        let p = system_prompt(
+        let v = volatile_context(
             Phase::Recon,
             &ScopeRules::default(),
             &[],
-            false,
             &["prefers ffuf over gobuster".to_string()],
+            &[],
+            &[],
             false,
         );
-        assert!(p.contains("prefers ffuf over gobuster"));
-        assert!(p.contains("learned about this operator"));
+        assert!(v.contains("prefers ffuf over gobuster"));
+        assert!(v.contains("Learned about this operator"));
     }
 
     #[tokio::test]

@@ -315,6 +315,18 @@ impl WorkspaceStore {
         )
     }
 
+    /// The most recent traced attempts (newest first), used to remind the agent what it has
+    /// already tried so it doesn't loop on dead ends.
+    pub fn attempts(&self, limit: usize) -> Result<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        query_events(
+            &conn,
+            "SELECT id, workspace_id, phase, kind, actor, author, parent_id, payload, ts
+             FROM events WHERE kind = ?1 ORDER BY ts DESC LIMIT ?2",
+            rusqlite::params![enc(&EventKind::Attempt)?, limit as i64],
+        )
+    }
+
     /// v0.1 recall: keyword over note / finding / agent-msg payloads. Vector recall is v0.2.
     pub fn keyword_recall(&self, query: &str, k: usize) -> Result<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
@@ -331,6 +343,30 @@ impl WorkspaceStore {
                 enc(&EventKind::AgentMsg)?,
                 like,
                 k as i64
+            ],
+        )
+    }
+
+    /// Full-text recall for the agent's `recall` tool: search the richer event kinds (tool outputs,
+    /// findings, notes, agent messages, attempts) and return the FULL stored payloads (not the
+    /// summarized/compacted form) so a dropped detail can be pulled back into context on demand.
+    pub fn search_events(&self, query: &str, limit: usize) -> Result<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        let like = format!("%{query}%");
+        query_events(
+            &conn,
+            "SELECT id, workspace_id, phase, kind, actor, author, parent_id, payload, ts
+             FROM events
+             WHERE kind IN (?1, ?2, ?3, ?4, ?5) AND payload LIKE ?6
+             ORDER BY ts DESC LIMIT ?7",
+            rusqlite::params![
+                enc(&EventKind::ToolOutput)?,
+                enc(&EventKind::Finding)?,
+                enc(&EventKind::Note)?,
+                enc(&EventKind::AgentMsg)?,
+                enc(&EventKind::Attempt)?,
+                like,
+                limit as i64
             ],
         )
     }

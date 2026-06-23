@@ -34,6 +34,7 @@ export default function AgentChat() {
   const setRunning = useAppStore((s) => s.setRunning);
   const newSession = useAppStore((s) => s.newSession);
   const switchSession = useAppStore((s) => s.switchSession);
+  const setActiveModel = useAppStore((s) => s.setActiveModel);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -104,9 +105,19 @@ export default function AgentChat() {
     } catch {}
   };
 
+  // Switching chats may swap the active model. When it differs from what the backend provider is
+  // currently built for, rebuild the provider first (settingsSetModel), THEN re-assert the active
+  // session (the rebuild resets the orchestrator's active session to default).
   const handleSwitchSession = async (id: string) => {
+    const target = useAppStore.getState().sessions.find((s) => s.id === id);
+    const desired = target?.model;
+    const current = useAppStore.getState().activeModel;
     switchSession(id);
     try {
+      if (desired && desired !== current) {
+        await ipc.settingsSetModel(desired);
+        setActiveModel(desired);
+      }
       await ipc.agentSwitchSession(id);
     } catch {}
   };
@@ -240,7 +251,7 @@ export default function AgentChat() {
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
+      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overflow-x-hidden p-3">
         {chat.length === 0 && (
           <p className="text-[13px] leading-relaxed text-ink-faint">
             {isStandalone
@@ -346,6 +357,15 @@ const Message = memo(function Message({ line }: { line: ChatLine }) {
     return (
       <div className="rounded-card border border-warn/30 bg-warn/8 px-2.5 py-1.5 text-[11px] text-warn">
         ◆ Finding: {line.text}
+      </div>
+    );
+  }
+  if (line.kind === "info") {
+    return (
+      <div className="flex items-center gap-2 py-0.5 text-[10px] text-ink-faint">
+        <span className="h-px flex-1 bg-base-500" />
+        <span className="shrink-0">{line.text}</span>
+        <span className="h-px flex-1 bg-base-500" />
       </div>
     );
   }

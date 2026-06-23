@@ -304,33 +304,42 @@ fn str_field(v: &Value) -> String {
 /// one, so the tools+system prefix is served from Anthropic's prompt cache on every turn after the
 /// first. In OAuth mode the Claude Code identity is prepended as the first block (required for a
 /// subscription token to be accepted). An empty system with no identity collapses to `[]`.
-fn system_blocks(system: &str, oauth: bool) -> Value {
+fn system_blocks(system: &[String], oauth: bool) -> Value {
     let mut blocks: Vec<Value> = Vec::new();
     if oauth {
         blocks.push(json!({ "type": "text", "text": CLAUDE_CODE_IDENTITY }));
     }
-    if !system.is_empty() {
-        blocks.push(json!({ "type": "text", "text": system }));
+    for s in system {
+        if !s.is_empty() {
+            blocks.push(json!({ "type": "text", "text": s }));
+        }
     }
     if blocks.is_empty() {
         return json!([]);
     }
-    let last = blocks.len() - 1;
-    blocks[last]["cache_control"] = json!({ "type": "ephemeral" });
+    // Cache the STABLE prefix only: the identity (OAuth) plus the first app block (the orchestrator
+    // sends stable instructions first, volatile context second). Putting the breakpoint on the
+    // first app block means everything before it — tools + identity + stable instructions — is a
+    // cache read on every later turn, while the volatile second block stays fresh. (Previously the
+    // breakpoint sat on the LAST block, so the volatile context was inside the cached prefix and
+    // busted the cache almost every turn.)
+    let cache_idx = if oauth && blocks.len() > 1 { 1 } else { 0 };
+    blocks[cache_idx]["cache_control"] = json!({ "type": "ephemeral" });
     Value::Array(blocks)
 }
 
-fn translate_messages(messages: &[Message]) -> (String, Vec<Value>) {
-    let mut system = String::new();
+fn translate_messages(messages: &[Message]) -> (Vec<String>, Vec<Value>) {
+    // Each system Content::Text becomes its own block, preserving the stable/volatile split the
+    // orchestrator builds so caching can break between them (see `system_blocks`).
+    let mut system: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for m in messages {
         if matches!(m.role, Role::System) {
             for c in &m.content {
                 if let Content::Text { text } = c {
-                    if !system.is_empty() {
-                        system.push('\n');
+                    if !text.is_empty() {
+                        system.push(text.clone());
                     }
-                    system.push_str(text);
                 }
             }
             continue;
@@ -373,7 +382,7 @@ mod tests {
 
     #[test]
     fn system_block_carries_cache_control() {
-        let block = system_blocks("you are a pentest assistant", false);
+        let block = system_blocks(&["you are a pentest assistant".to_string()], false);
         let first = &block[0];
         assert_eq!(first["type"], "text");
         assert_eq!(first["text"], "you are a pentest assistant");
@@ -382,14 +391,14 @@ mod tests {
 
     #[test]
     fn empty_system_collapses_to_empty_array() {
-        let block = system_blocks("", false);
+        let block = system_blocks(&[String::new()], false);
         assert_eq!(block, json!([]));
     }
 
     #[test]
     fn oauth_prepends_claude_code_identity() {
-        let block = system_blocks("you are a pentest assistant", true);
-        // Identity comes first, app system second, cache breakpoint on the last block only.
+        let block = system_blocks(&["you are a pentest assistant".to_string()], true);
+        // Identity first (no cache), app system second WITH the cache breakpoint.
         assert_eq!(block[0]["text"], CLAUDE_CODE_IDENTITY);
         assert!(block[0].get("cache_control").is_none());
         assert_eq!(block[1]["text"], "you are a pentest assistant");
@@ -398,9 +407,19 @@ mod tests {
 
     #[test]
     fn oauth_with_empty_system_still_sends_identity() {
-        let block = system_blocks("", true);
+        let block = system_blocks(&[String::new()], true);
         assert_eq!(block[0]["text"], CLAUDE_CODE_IDENTITY);
         assert_eq!(block[0]["cache_control"]["type"], "ephemeral");
         assert_eq!(block.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cache_breakpoint_sits_before_the_volatile_block() {
+        // Stable instructions + volatile context: only the stable (first) block is cached.
+        let block = system_blocks(&["stable instructions".into(), "volatile scope+notes".into()], false);
+        assert_eq!(block[0]["text"], "stable instructions");
+        assert_eq!(block[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(block[1]["text"], "volatile scope+notes");
+        assert!(block[1].get("cache_control").is_none(), "volatile block must NOT be cached");
     }
 }

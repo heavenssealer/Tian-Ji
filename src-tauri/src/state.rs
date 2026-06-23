@@ -146,6 +146,26 @@ pub fn ollama_host(app: &AppStore) -> String {
         .unwrap_or_else(|| DEFAULT_OLLAMA_HOST.to_string())
 }
 
+/// Directories scanned for installed Agent Skills (`*/SKILL.md`). An optional `skills_dir` setting
+/// is searched first, then the standard `~/.claude/skills` (where `npx skills add …` installs) and a
+/// project-local `.claude/skills`. Missing dirs are simply skipped by the scanner.
+pub fn skill_dirs(app: &AppStore) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut dirs = Vec::new();
+    if let Some(custom) = app.get_setting("skills_dir").ok().flatten() {
+        let custom = custom.trim();
+        if !custom.is_empty() {
+            dirs.push(PathBuf::from(custom));
+        }
+    }
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    if let Ok(home) = std::env::var(home_var) {
+        dirs.push(PathBuf::from(&home).join(".claude").join("skills"));
+    }
+    dirs.push(PathBuf::from(".claude").join("skills"));
+    dirs
+}
+
 /// The configured Ollama context window (`num_ctx`), clamped to a usable minimum.
 pub fn ollama_num_ctx(app: &AppStore) -> u32 {
     app.get_setting("ollama_num_ctx")
@@ -221,7 +241,11 @@ impl CurrentWorkspace {
         let context_budget = if model.starts_with("ollama:") {
             (num_ctx as usize).saturating_sub(2_048).max(4_000)
         } else {
-            16_000
+            // Cloud: the conversation history (re-sent and billed as fresh input every turn, since
+            // front-trimming makes it un-cacheable) is the dominant per-message cost. Keep it
+            // conservative — key facts survive outside raw history via the notebook/findings/attempt
+            // log that get re-injected each turn.
+            12_000
         };
 
         // Small-context mode — a tiny local window (≤ 8k) can't fit the full prompt + a useful
@@ -231,8 +255,12 @@ impl CurrentWorkspace {
         // One cancellation flag shared by the orchestrator AND the command runner, so Stop
         // interrupts an in-flight tool (not just the round loop between tools).
         let cancel = Arc::new(AtomicBool::new(false));
+        // RTK output compression: on by default, but a silent no-op unless the `rtk` binary is
+        // installed. Operators can disable it by setting `use_rtk` to "false".
+        let use_rtk = app.get_setting("use_rtk").ok().flatten().map(|v| v != "false").unwrap_or(true);
         let runner = tianji_agent::ProcessRunner::with_sudo_password(sudo_pw)
-            .with_cancel(cancel.clone());
+            .with_cancel(cancel.clone())
+            .with_rtk(use_rtk);
         let orchestrator = Orchestrator::new(provider)
             .with_subagent_provider(subagent_provider)
             .with_runner(Arc::new(runner))
@@ -240,6 +268,7 @@ impl CurrentWorkspace {
             .with_budget(tokens_spent, token_budget)
             .with_context_budget(context_budget)
             .with_small_context(small_context)
+            .with_skills(tianji_agent::SkillCatalog::discover(&skill_dirs(app)))
             .with_flags(autonomous, free_mode);
         // Restore prior conversations so the agent doesn't start from scratch after a restart,
         // workspace switch, or model/key change (all of which rebuild this bundle).

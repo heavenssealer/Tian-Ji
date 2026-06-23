@@ -144,24 +144,44 @@ async fn post_token(body: &Value) -> Result<OauthTokens, String> {
     Ok(OauthTokens { access_token, refresh_token, expires_at: now() + expires_in })
 }
 
-// ── keychain persistence ──────────────────────────────────────────────────────
+// ── keychain persistence (with an in-memory cache) ─────────────────────────────
+
+// Process-wide token cache. Reading the OS keychain prompts for the keychain password on macOS
+// when the app binary isn't trusted, and `access_token()` runs on EVERY LLM call — so an agentic
+// loop triggered a flurry of prompts "every few minutes". We read the keychain at most once, then
+// serve from memory; only a refresh or an explicit connect/disconnect touches the keychain again.
+// `loaded` distinguishes "cache is authoritative" from "never read yet".
+static TOKEN_CACHE: std::sync::Mutex<(bool, Option<OauthTokens>)> =
+    std::sync::Mutex::new((false, None));
 
 pub fn store_tokens(tokens: &OauthTokens) -> AppResult<()> {
     let json = serde_json::to_string(tokens)
         .map_err(|e| AppError::Message(format!("serialize tokens: {e}")))?;
-    crate::secrets::set_api_key(OAUTH_PROVIDER, &json)
+    crate::secrets::set_api_key(OAUTH_PROVIDER, &json)?;
+    *TOKEN_CACHE.lock().unwrap() = (true, Some(tokens.clone()));
+    Ok(())
 }
 
 pub fn load_tokens() -> AppResult<Option<OauthTokens>> {
-    match crate::secrets::get_api_key(OAUTH_PROVIDER)? {
-        Some(s) if !s.trim().is_empty() => Ok(serde_json::from_str(&s).ok()),
-        _ => Ok(None),
+    {
+        let cache = TOKEN_CACHE.lock().unwrap();
+        if cache.0 {
+            return Ok(cache.1.clone());
+        }
     }
+    let parsed = match crate::secrets::get_api_key(OAUTH_PROVIDER)? {
+        Some(s) if !s.trim().is_empty() => serde_json::from_str(&s).ok(),
+        _ => None,
+    };
+    *TOKEN_CACHE.lock().unwrap() = (true, parsed.clone());
+    Ok(parsed)
 }
 
 /// Forget the subscription (clears the stored tokens — turns fall back to the API key, if set).
 pub fn clear_tokens() -> AppResult<()> {
-    crate::secrets::set_api_key(OAUTH_PROVIDER, "")
+    crate::secrets::set_api_key(OAUTH_PROVIDER, "")?;
+    *TOKEN_CACHE.lock().unwrap() = (true, None);
+    Ok(())
 }
 
 // ── token source for the LLM adapter ──────────────────────────────────────────

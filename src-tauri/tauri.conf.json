@@ -17,7 +17,8 @@
         "height": 900,
         "minWidth": 1024,
         "minHeight": 680,
-        "theme": "Dark"
+        "theme": "Dark",
+        "decorations": false
       }
     ],
     "security": {

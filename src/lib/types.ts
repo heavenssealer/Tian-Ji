@@ -33,7 +33,7 @@ export type ApprovalResolution =
 export interface AgentDelta {
   type: "text_delta" | "tool_call" | "tool_output" | "turn_end" | "error" | "denied" | "finding" | "token_usage"
       | "subagent_start" | "subagent_text" | "subagent_end"
-      | "goal_start" | "goal_iteration" | "goal_end";
+      | "goal_start" | "goal_iteration" | "goal_end" | "compacted" | "skill_used";
   text?: string;
   input?: number;
   output?: number;
@@ -66,9 +66,26 @@ export interface PolicyRuleDto {
   ruleJson: string;
 }
 
+/** RTK (Rust Token Killer) status reported by the backend. `active` = enabled && available. */
+export interface RtkStatus {
+  enabled: boolean;
+  available: boolean;
+  path: string | null;
+}
+
+/** Installed Agent Skills discovered by the backend. */
+export interface SkillsStatus {
+  count: number;
+  names: string[];
+  dirs: string[];
+}
+
 export interface ChatSession {
   id: string;
   name: string;
+  /** Per-chat model id (e.g. "claude-sonnet-4-6" or "ollama:llama3.1"). Lets each chat run a
+   *  different model; undefined means "use the current/last model". */
+  model?: string;
 }
 
 export type ProfileScope = "global" | "workspace";

@@ -83,7 +83,16 @@ pub async fn workspace_create(
     name: String,
     scope_cidrs: Vec<String>,
 ) -> AppResult<WorkspaceInfo> {
-    let dir = state.workspaces_root.join(slug(&name));
+    // Always allocate a FRESH directory. If the slug already exists on disk (a workspace with the
+    // same name, or orphaned data from a deleted one), opening it would silently reuse the old DB —
+    // so the "new" workspace would inherit the old notes/findings and even its id. Suffix until unique.
+    let base = slug(&name);
+    let mut dir = state.workspaces_root.join(&base);
+    let mut n = 2;
+    while dir.exists() {
+        dir = state.workspaces_root.join(format!("{base}-{n}"));
+        n += 1;
+    }
     let store = WorkspaceStore::open(&dir)?;
     store.set_scope(&ScopeRules { cidrs: scope_cidrs.clone(), ..Default::default() })?;
 
