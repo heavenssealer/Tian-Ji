@@ -1,6 +1,6 @@
 <div align="center">
 
-![Tiān Jī](app-icon.png)
+![Tiān Jī](banner.svg)
 
 # Tiān Jī (天机)
 

@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300">
+  <defs>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#27272a" stroke-width="0.8"/>
+    </pattern>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#e8833a" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#e8833a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="bgGlow" cx="50%" cy="50%" r="40%">
+      <stop offset="0%" stop-color="#e8833a" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#09090b" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="amberGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f0954f"/>
+      <stop offset="100%" stop-color="#e8833a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="300" fill="#09090b"/>
+  <rect width="1200" height="300" fill="url(#grid)" opacity="0.4"/>
+  <rect width="1200" height="300" fill="url(#bgGlow)"/>
+
+  <!-- Content shift -->
+  <g transform="translate(172, 0)">
+
+    <!-- Icon glow -->
+    <circle cx="150" cy="150" r="95" fill="url(#glow)"/>
+
+    <!-- Icon card -->
+    <rect x="74" y="74" width="152" height="152" rx="22" fill="#111113"/>
+    <rect x="74" y="74" width="152" height="152" rx="22"
+          fill="#e8833a" fill-opacity="0.08" stroke="#e8833a" stroke-width="1" stroke-opacity="0.3"/>
+
+    <!-- 天 character -->
+    <text x="150" y="168"
+          font-family="'Noto Sans CJK SC','PingFang SC','Microsoft YaHei','Hiragino Sans GB',sans-serif"
+          font-size="82" font-weight="700"
+          fill="url(#amberGrad)" text-anchor="middle">天</text>
+
+    <!-- Vertical divider -->
+    <line x1="270" y1="70" x2="270" y2="230" stroke="#27272a" stroke-width="1.5"/>
+
+    <!-- Label -->
+    <text x="308" y="116"
+          font-family="'Courier New', Courier, monospace"
+          font-size="12" font-weight="500"
+          fill="#e8833a" letter-spacing="5">TIĀN JĪ · 天机</text>
+
+    <!-- Main title -->
+    <text x="304" y="176"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="52" font-weight="700"
+          fill="#f4f4f5" letter-spacing="-2">Pentest · AI Operator</text>
+
+    <!-- Subtitle -->
+    <text x="308" y="208"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="15" fill="#8c8c99">
+      Scope-bound · policy-gated · evidence-driven
+    </text>
+
+    <!-- Tech pills -->
+    <rect x="308" y="230" width="48" height="24" rx="5" fill="#111113" stroke="#3f3f46" stroke-width="1"/>
+    <text x="332" y="246" text-anchor="middle"
+          font-family="'Courier New', Courier, monospace"
+          font-size="11" fill="#a1a1aa">Rust</text>
+
+    <rect x="366" y="230" width="52" height="24" rx="5" fill="#111113" stroke="#3f3f46" stroke-width="1"/>
+    <text x="392" y="246" text-anchor="middle"
+          font-family="'Courier New', Courier, monospace"
+          font-size="11" fill="#a1a1aa">Tauri</text>
+
+    <rect x="428" y="230" width="80" height="24" rx="5" fill="#111113" stroke="#3f3f46" stroke-width="1"/>
+    <text x="468" y="246" text-anchor="middle"
+          font-family="'Courier New', Courier, monospace"
+          font-size="11" fill="#a1a1aa">DeepSeek</text>
+
+    <rect x="518" y="230" width="84" height="24" rx="5" fill="#111113" stroke="#3f3f46" stroke-width="1"/>
+    <text x="560" y="246" text-anchor="middle"
+          font-family="'Courier New', Courier, monospace"
+          font-size="11" fill="#a1a1aa">Anthropic</text>
+
+    <rect x="612" y="230" width="62" height="24" rx="5" fill="#111113" stroke="#3f3f46" stroke-width="1"/>
+    <text x="643" y="246" text-anchor="middle"
+          font-family="'Courier New', Courier, monospace"
+          font-size="11" fill="#a1a1aa">Ollama</text>
+
+    <rect x="684" y="230" width="52" height="24" rx="5" fill="#111113" stroke="#3f3f46" stroke-width="1"/>
+    <text x="710" y="246" text-anchor="middle"
+          font-family="'Courier New', Courier, monospace"
+          font-size="11" fill="#a1a1aa">Policy</text>
+  </g>
+
+  <!-- Bottom amber accent line -->
+  <rect x="0" y="296" width="1200" height="4" rx="2" fill="#e8833a" opacity="0.45"/>
+
+  <!-- Decorative dot grid top-right -->
+  <circle cx="1130" cy="36" r="1.8" fill="#e8833a" opacity="0.5"/>
+  <circle cx="1148" cy="36" r="1.8" fill="#e8833a" opacity="0.35"/>
+  <circle cx="1166" cy="36" r="1.8" fill="#e8833a" opacity="0.2"/>
+  <circle cx="1130" cy="54" r="1.8" fill="#e8833a" opacity="0.35"/>
+  <circle cx="1148" cy="54" r="1.8" fill="#e8833a" opacity="0.2"/>
+  <circle cx="1166" cy="54" r="1.8" fill="#e8833a" opacity="0.1"/>
+  <circle cx="1130" cy="72" r="1.8" fill="#e8833a" opacity="0.2"/>
+  <circle cx="1148" cy="72" r="1.8" fill="#e8833a" opacity="0.1"/>
+</svg>
