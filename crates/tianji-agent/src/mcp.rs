@@ -68,12 +68,14 @@ fn use_skill_spec() -> ToolSpec {
     ToolSpec {
         name: "use_skill".to_string(),
         description: "Load an installed skill (a proven playbook — see the catalog in your system \
-                      prompt). TWO-LEVEL: call use_skill(name=\"ctf-web\") first to get the skill's \
-                      router/overview and its list of technique files; then call use_skill again \
-                      with file=\"<one of those files>\" (e.g. file=\"sql-injection.md\") to get the \
-                      detailed step-by-step procedure for the specific technique that applies. \
-                      ACTUALLY FOLLOW the loaded steps and run the commands/scripts it gives you — \
-                      do not just acknowledge it. Use this BEFORE improvising on a matching challenge."
+                      prompt). TWO-LEVEL: call use_skill(name=\"ctf-web\") first to get the router \
+                      (a list of technique files with one-line descriptions). \
+                      THEN — before doing anything else — pick the file that matches your target \
+                      and call use_skill AGAIN with file=\"<that filename>\" (e.g. \
+                      file=\"sql-injection.md\"). The second call loads the detailed step-by-step \
+                      procedure. FOLLOW those steps and run the commands it gives you. \
+                      Do NOT just acknowledge the router list — you MUST load a specific file \
+                      and execute its procedure."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",

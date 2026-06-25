@@ -15,6 +15,14 @@ use tauri::Manager;
 use tianji_store::AppStore;
 
 fn main() {
+    // WebKitGTK GPU compositing crashes the display server on some Linux configurations
+    // (drm_mode_rmfb_work_fn hogged CPU → GPU lockup → system freeze → forced reboot).
+    // Disabling compositing forces software rendering, which avoids GPU driver bugs entirely.
+    // The trade-off (slightly higher CPU for rendering) is negligible for a chat-heavy UI.
+    if cfg!(target_os = "linux") {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

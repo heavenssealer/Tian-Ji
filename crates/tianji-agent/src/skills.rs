@@ -131,7 +131,19 @@ impl SkillCatalog {
         let body = std::fs::read_to_string(skill.dir.join("SKILL.md")).ok()?;
         let files = list_bundled_files(&skill.dir);
 
-        let mut out = format!("# Skill: {}\n{}\n", skill.name, truncate(&body, SKILL_BODY_CAP));
+        let body = sanitize_for_model(&body);
+        // Two-level disclosure: the router lists technique files; the agent MUST pick one and
+        // call use_skill again. DeepSeek needs this instruction at the TOP, before the body,
+        // or it skims the router list and ignores it.
+        let mut out = format!(
+            "## HOW TO USE THIS SKILL\n\
+             This is a ROUTER — it lists techniques below, not the steps themselves.\n\
+             1. Read the technique list below and pick the ONE that matches your target.\n\
+             2. Call use_skill AGAIN immediately with file=\"<that filename>\" (e.g. file=\"sql-injection.md\").\n\
+             3. The second call loads the full step-by-step procedure. FOLLOW those steps.\n\
+             Do NOT just read this list and move on — you MUST load a specific technique.\n\n\
+             # Skill: {}\n{}\n",
+            skill.name, truncate(&body, SKILL_BODY_CAP));
         if !files.is_empty() {
             out.push_str(&format!(
                 "\n--- This skill routes to detailed technique files. To read the one you need, call \
@@ -164,7 +176,7 @@ impl SkillCatalog {
             return None;
         }
         let content = std::fs::read_to_string(&canon).ok()?;
-        Some(format!("# Skill {} — file: {}\n{}", skill.name, file, truncate(&content, SKILL_FILE_CAP)))
+        Some(format!("# Skill {} — file: {}\n{}", skill.name, file, truncate(&sanitize_for_model(&content), SKILL_FILE_CAP)))
     }
 }
 
@@ -245,7 +257,7 @@ fn parse_frontmatter(content: &str) -> (Option<String>, Option<String>) {
 /// Build the full cached-prompt CTF-playbook section from a raw solve-challenge body: cap it,
 /// rewrite slash commands to `use_skill(...)`, and wrap it in the mandatory-playbook header.
 fn render_preload_full(body: &str) -> String {
-    let translated = rewrite_slash_commands(&truncate(body, PRELOAD_BODY_CAP));
+    let translated = sanitize_for_model(&truncate(body, PRELOAD_BODY_CAP));
     format!(
         "\n\n## MANDATORY CTF PLAYBOOK (pre-loaded — follow before improvising)\n\
          The following orchestrator skill is always active. For ANY CTF challenge, follow \
@@ -326,6 +338,17 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Remove Claude-specific references from skill bodies so non-Claude models (DeepSeek, Ollama)
+/// don't get confused or think the content isn't meant for them. Also rewrites `/ctf-*` slash
+/// commands to `use_skill(…)` calls so the instructions are immediately actionable.
+fn sanitize_for_model(text: &str) -> String {
+    let text = text
+        .replace("Claude Code or similar", "this environment")
+        .replace("Claude Code", "this application")
+        .replace("(Claude Code or similar)", "(this application)");
+    rewrite_slash_commands(&text)
 }
 
 fn normalize(s: &str) -> String {

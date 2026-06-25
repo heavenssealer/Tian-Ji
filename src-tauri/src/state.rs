@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tianji_agent::Orchestrator;
-use tianji_llm::{ClaudeAuth, ClaudeProvider, DeepSeekProvider, LlmProvider, OllamaProvider};
+use tianji_llm::{ClaudeAuth, ClaudeProvider, LlmProvider, OllamaProvider};
 use tianji_pty::PtyManager;
 use tianji_store::{AppStore, WorkspaceMeta, WorkspaceStore};
 
@@ -191,10 +191,18 @@ fn build_provider(model: &str, auth: ClaudeAuth, ollama_host: &str, num_ctx: u32
                 .with_num_ctx(num_ctx),
         )
     } else if model.starts_with("deepseek") {
-        // DeepSeek is an OpenAI-compatible cloud model with its own API key (no OAuth, no shared
-        // Anthropic auth). An absent key is allowed — the provider errors only when a turn runs.
+        // DeepSeek has a native Anthropic-compatible endpoint (https://api.deepseek.com/anthropic)
+        // that speaks the full Anthropic Messages API — system blocks, tool_use/tool_result, SSE
+        // streaming, `x-api-key` auth. Using ClaudeProvider against it preserves all the prompt
+        // engineering done for Claude (two-block system, tools format, cache control) without any
+        // OpenAI↔Anthropic translation layer. The old DeepSeekProvider (OpenAI format) is retained
+        // as a fallback but is no longer the default path.
         let key = crate::secrets::get_api_key("deepseek").ok().flatten().unwrap_or_default();
-        Arc::new(DeepSeekProvider::new(key, model))
+        Arc::new(
+            ClaudeProvider::with_auth(ClaudeAuth::ApiKey(key))
+                .with_model(model)
+                .with_base_url("https://api.deepseek.com/anthropic"),
+        )
     } else {
         Arc::new(ClaudeProvider::with_auth(auth).with_model(model))
     }

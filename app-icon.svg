@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- Subtle radial glow behind the character -->
+    <radialGradient id="glow" cx="50%" cy="45%" r="40%">
+      <stop offset="0%" stop-color="#e8833a" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#e8833a" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Amber gradient for the character -->
+    <linearGradient id="amberGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f0954f"/>
+      <stop offset="100%" stop-color="#e8833a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- App background (matches base-900, rounded for macOS icon shape) -->
+  <rect width="1024" height="1024" rx="180" fill="#0a0a0b"/>
+
+  <!-- Ambient glow -->
+  <rect width="1024" height="1024" rx="180" fill="url(#glow)"/>
+
+  <!-- Rounded box matching Brand component style -->
+  <rect x="176" y="176" width="672" height="672" rx="72"
+        fill="rgba(232,131,58,0.15)"
+        stroke="rgba(232,131,58,0.30)"
+        stroke-width="16"/>
+
+  <!-- 天 character — CJK-friendly font stack -->
+  <text x="512" y="672"
+        font-family="'Noto Sans CJK SC','PingFang SC','Microsoft YaHei','Hiragino Sans GB',sans-serif"
+        font-size="440"
+        font-weight="600"
+        fill="url(#amberGrad)"
+        text-anchor="middle"
+        dominant-baseline="central">天</text>
+</svg>

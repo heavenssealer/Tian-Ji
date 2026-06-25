@@ -15,8 +15,9 @@ jobs:
             name: linux
           - runner: windows-latest
             name: windows
-          - runner: macos-latest
+          - runner: macos-14
             name: macos
+            target: aarch64-apple-darwin
 
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.name }}
@@ -52,9 +53,9 @@ jobs:
         # MSI (WiX) fails on non-ASCII product names; NSIS handles Unicode correctly.
         run: npm run tauri build -- --bundles nsis
 
-      - name: Build (macOS)
+      - name: Build (macOS / Apple Silicon)
         if: matrix.name == 'macos'
-        run: npm run tauri build -- --bundles dmg
+        run: npm run tauri build -- --target aarch64-apple-darwin --bundles dmg
 
       # Cargo workspace target dir is at the repo root, not src-tauri/target.
       - name: Upload (Linux)

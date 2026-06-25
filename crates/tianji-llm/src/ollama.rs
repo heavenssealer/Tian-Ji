@@ -97,6 +97,10 @@ impl LlmProvider for OllamaProvider {
         tokio::spawn(async move { pump_ndjson(resp.bytes_stream(), tx).await });
         Ok(Box::pin(rx))
     }
+
+    fn provider_id(&self) -> &str {
+        "ollama"
+    }
 }
 
 // ── NDJSON pump ────────────────────────────────────────────────────────────────

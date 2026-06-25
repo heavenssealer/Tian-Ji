@@ -20,7 +20,8 @@ use tianji_types::{AgentEvent, Content, Message, Role, ToolCall, ToolSpec};
 
 use crate::{LlmError, LlmProvider, Result};
 
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
+/// Base URL (without /v1/messages) used as the default and for DeepSeek's endpoint.
+const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Beta flag Anthropic requires on subscription (OAuth) requests — the same one the Claude Code
@@ -55,13 +56,17 @@ pub enum ClaudeAuth {
 /// - `pool_max_idle_per_host(0)` — never reuse an idle connection; open a fresh one each turn.
 /// - `http1_only` — avoid HTTP/2 GOAWAY / multiplexing issues over VPN tunnels.
 /// - `tcp_keepalive` — keep the streaming connection alive during long SSE responses.
-/// - `connect_timeout` only (NOT a request timeout, which would abort long streams).
+/// - `connect_timeout` — fail fast if the server is unreachable (30s).
+/// - `timeout` — overall request timeout (300s) prevents permanent hangs if the SSE stream
+///   stalls mid-response. This is generous enough for slow LLM generations but prevents
+///   the "LLM stalls → whole app freezes" failure mode observed with DeepSeek's endpoint.
 fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .http1_only()
         .tcp_keepalive(std::time::Duration::from_secs(60))
         .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -69,6 +74,9 @@ fn build_client() -> reqwest::Client {
 pub struct ClaudeProvider {
     auth: ClaudeAuth,
     model: String,
+    /// Base URL for the Anthropic Messages API. Defaults to `https://api.anthropic.com`.
+    /// DeepSeek's Anthropic-compatible endpoint overrides this to `https://api.deepseek.com/anthropic`.
+    base_url: String,
     http: reqwest::Client,
 }
 
@@ -83,12 +91,21 @@ impl ClaudeProvider {
         Self {
             auth,
             model: "claude-opus-4-8".to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
             http: build_client(),
         }
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
+        self
+    }
+
+    /// Point at an Anthropic-compatible endpoint other than api.anthropic.com. DeepSeek exposes
+    /// `https://api.deepseek.com/anthropic` which speaks the full Anthropic Messages API — system
+    /// blocks, tool_use/tool_result, SSE streaming, `x-api-key` auth — all wire-compatible.
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into().trim_end_matches('/').to_string();
         self
     }
 }
@@ -123,7 +140,10 @@ impl LlmProvider for ClaudeProvider {
         // Auth diverges only here: an API key goes on `x-api-key`; a subscription token goes on
         // `Authorization: Bearer` with the `oauth-2025-04-20` beta flag (and the Claude Code
         // identity already prepended to `system` above).
-        let mut req = self.http.post(API_URL).header("anthropic-version", ANTHROPIC_VERSION);
+        let mut req = self
+            .http
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("anthropic-version", ANTHROPIC_VERSION);
         match &self.auth {
             ClaudeAuth::ApiKey(key) => {
                 if key.is_empty() {
@@ -154,6 +174,13 @@ impl LlmProvider for ClaudeProvider {
         let (tx, rx) = mpsc::unbounded::<AgentEvent>();
         tokio::spawn(async move { pump_sse(resp.bytes_stream(), tx).await });
         Ok(Box::pin(rx))
+    }
+    fn provider_id(&self) -> &str {
+        if self.base_url.contains("deepseek") {
+            "deepseek"
+        } else {
+            "claude"
+        }
     }
 }
 
@@ -187,8 +214,13 @@ where
                         &mut output_tokens,
                     ) {
                         ended = true;
+                        // message_stop received — don't wait for the stream to close.
+                        // DeepSeek's endpoint may keep the connection alive (HTTP keep-alive),
+                        // which would block stream.next() forever. We have everything we need.
+                        break;
                     }
                 }
+                if ended { break; }
             }
             Err(e) => {
                 let _ = tx.unbounded_send(AgentEvent::Error { message: e.to_string() });
@@ -245,7 +277,10 @@ fn on_sse_message(
                 Some("text_delta") => {
                     let t = str_field(&v["delta"]["text"]);
                     if !t.is_empty() {
-                        let _ = tx.unbounded_send(AgentEvent::TextDelta { text: t });
+                        // DeepSeek's Anthropic endpoint may emit text_deltas with trailing
+                        // newlines that turn each word into a separate ReactMarkdown paragraph.
+                        // Trim trailing whitespace so concatenation produces flowing prose.
+                        let _ = tx.unbounded_send(AgentEvent::TextDelta { text: t.trim_end().to_string() });
                     }
                 }
                 Some("input_json_delta") => {

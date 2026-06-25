@@ -50,3 +50,9 @@ desktop.ini
 
 # ── Claude Code local settings ───────────────────────────────────────────────
 .claude/
+
+# ── AI assistant session data (never commit chat history / attachments) ─────
+.reasonix/
+
+# ── Local crash/debug logs ────────────────────────────────────────────────────
+*.log

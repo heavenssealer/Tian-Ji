@@ -70,6 +70,14 @@ const RECALL_CHARS_PER_HIT: usize = 2_500;
 /// accident in ordinary prose.
 const GOAL_DONE_TOKEN: &str = "[[GOAL_COMPLETE]]";
 const GOAL_STUCK_TOKEN: &str = "[[GOAL_BLOCKED]]";
+/// Hard cap on stored messages per session (beyond this the oldest are dropped from memory).
+/// Prevents unbounded growth from models that fire 50+ tool calls per turn. The event log and
+/// per-turn trimming already bound what reaches the model; this protects the host process.
+const MAX_STORED_MESSAGES: usize = 300;
+/// How many turns between full conversation persistence to SQLite. Every turn writes the entire
+/// history as JSON — for long runs this churns I/O and memory. We still persist on compaction
+/// and on a slower cadence (every N turns); the event log is the durable source of truth.
+const CONVERSATION_SAVE_INTERVAL: usize = 8;
 
 /// How a standalone goal run ended. The label is surfaced to the operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +190,9 @@ pub struct Orchestrator {
     /// Installed Agent Skills (CTF playbooks etc.). Catalog goes into the prompt; the `use_skill`
     /// tool loads full instructions on demand. Available to cloud and local agents alike.
     skills: SkillCatalog,
+    /// Turns executed since the last full conversation persistence. Used to throttle SQLite writes
+    /// so long agentic runs don't serialize the entire history to JSON every turn.
+    turns_since_save: std::sync::Mutex<usize>,
 }
 
 impl Orchestrator {
@@ -208,6 +219,7 @@ impl Orchestrator {
             context_budget: 16_000,
             small_context: false,
             skills: SkillCatalog::empty(),
+            turns_since_save: std::sync::Mutex::new(0),
         }
     }
 
@@ -236,11 +248,15 @@ impl Orchestrator {
         self
     }
 
-    /// Per-turn tool-output cap — tighter when the model's window is tiny. Tool results are the
-    /// bulkiest thing in the re-sent history, so keeping this modest directly cuts per-message cost
-    /// (the raw output is still in the event log if the operator needs it).
+    /// Per-turn tool-output cap — tighter when the model's window is tiny.
+    ///
+    /// Truncation is false economy when set too aggressively: the agent re-reads files in
+    /// fragments, each costing a full tool-call round + re-send overhead, burning MORE tokens
+    /// than seeing the whole file once. 6 000 chars covers typical exploit scripts, nmap scans,
+    /// and config files; truly huge outputs (wordlists, kernel sources) still get truncated and
+    /// should be accessed via the `recall` tool.
     fn tool_output_cap(&self) -> usize {
-        if self.small_context { 768 } else { 1_400 }
+        if self.small_context { 768 } else { 6_000 }
     }
 
     fn assembler(&self) -> ContextAssembler {
@@ -378,6 +394,19 @@ impl Orchestrator {
     /// tests and diagnostics.
     pub fn history_len(&self, session_id: &str) -> usize {
         self.histories.lock().unwrap().get(session_id).map_or(0, |h| h.len())
+    }
+
+    /// Force-persist the active session's conversation to the store. Called after compaction
+    /// (which already persists its result) and when the operator pauses/stops. The regular
+    /// per-turn path throttles persistence to every N turns to avoid I/O churn.
+    pub fn save_current_conversation(&self, store: &WorkspaceStore) {
+        let session_id = self.active_session.lock().unwrap().clone();
+        let histories = self.histories.lock().unwrap();
+        if let Some(h) = histories.get(&session_id) {
+            if let Ok(json) = serde_json::to_string(h) {
+                let _ = store.save_conversation(&session_id, &json);
+            }
+        }
     }
 
     /// The always-injected profile for a turn: the operator's global habits followed by this
@@ -678,7 +707,7 @@ impl Orchestrator {
             let mut msgs = vec![
                 Message { role: Role::System, content: vec![
                     // Block 1 (cached): stable instructions. Block 2 (uncached): volatile context.
-                    text(stable_system_prompt(self.small_context, self.free_mode.load(Ordering::SeqCst), &self.skills.catalog_text(), &solve_section, machine)),
+                    text(stable_system_prompt(self.small_context, self.free_mode.load(Ordering::SeqCst), &self.skills.catalog_text(), &solve_section, machine, self.provider.provider_id())),
                     text(volatile_context(phase, &scope, &notes, &self.profile_for(store), &attempts, &findings, self.small_context)),
                 ] },
             ];
@@ -820,9 +849,22 @@ impl Orchestrator {
                 let mut histories = self.histories.lock().unwrap();
                 let h = histories.entry(session_id.clone()).or_default();
                 h.extend(new_entries);
-                // Cache the conversation to the workspace DB so it survives restarts/rebuilds.
-                if let Ok(json) = serde_json::to_string(&*h) {
-                    let _ = store.save_conversation(&session_id, &json);
+                // Hard cap: drop oldest messages beyond MAX_STORED_MESSAGES. This prevents
+                // unbounded memory growth from models firing 50+ tool calls per turn.
+                if h.len() > MAX_STORED_MESSAGES {
+                    let drain = h.len() - MAX_STORED_MESSAGES;
+                    h.drain(0..drain);
+                }
+                // Throttle persistence: writing the full history JSON to SQLite every turn
+                // churns I/O and allocates a large string. Save every N turns + on compaction
+                // (which calls save_conversation directly). The event log is the durable source.
+                let mut counter = self.turns_since_save.lock().unwrap();
+                *counter += 1;
+                if *counter >= CONVERSATION_SAVE_INTERVAL {
+                    *counter = 0;
+                    if let Ok(json) = serde_json::to_string(&*h) {
+                        let _ = store.save_conversation(&session_id, &json);
+                    }
                 }
             }
         }
@@ -891,7 +933,7 @@ impl Orchestrator {
                 role: Role::System,
                 content: vec![text(format!(
                     "{}\n{}{recalled_hint}",
-                    stable_system_prompt(self.small_context, free, &self.skills.catalog_text(), &solve_section, machine),
+                    stable_system_prompt(self.small_context, free, &self.skills.catalog_text(), &solve_section, machine, self.subagent_provider.provider_id()),
                     volatile_context(subagent_phase, &scope, &notes, &self.profile_for(store), &attempts, &findings, self.small_context),
                 ))],
             },
@@ -1722,7 +1764,7 @@ fn machine_methodology(slim: bool) -> String {
         .to_string()
 }
 
-fn stable_system_prompt(slim: bool, free_mode: bool, skills_catalog: &str, solve_challenge: &str, machine: bool) -> String {
+fn stable_system_prompt(slim: bool, free_mode: bool, skills_catalog: &str, solve_challenge: &str, machine: bool, provider_id: &str) -> String {
     // Tell the model the operator OS so it picks the right command syntax. Slim mode uses a one-line
     // form to save tokens.
     let os_hint = match (slim, cfg!(windows)) {
@@ -1780,56 +1822,139 @@ fn stable_system_prompt(slim: bool, free_mode: bool, skills_catalog: &str, solve
              log routine enumeration as findings. \
              If a detail was summarized away or compacted out of context, use the recall tool to \
              fetch the full original output before assuming it's lost. \
-             BE EXTREMELY TERSE: a few words of reasoning at most — no narration, no restating \
-             output, no plans. Spend tokens on tool calls and findings, not prose. \
-             Do NOT delegate to sub-agents — do the work inline (delegation multiplies context and \
-             won't fit this window). \
+             {reasoning_slim}\
+             {delegation_slim}\
              Never re-run a scan whose output is already in context; read the earlier result. One \
              port scan per host. To inspect a file, grep for what you need rather than dumping it \
              whole; if a result was truncated, call recall — never re-page it with sed ranges. \
              Stay strictly within scope — never touch hosts outside it. \
              {os_hint} {install_hint}{skills_catalog}{solve_challenge}{machine_block}",
+            reasoning_slim = if provider_id == "deepseek" {
+                "REASON OUT LOUD: one sentence of thought before each tool call. "
+            } else {
+                "BE EXTREMELY TERSE: a few words of reasoning at most — no narration, no restating \
+                 output, no plans. Spend tokens on tool calls and findings, not prose. "
+            },
+            delegation_slim = if provider_id == "deepseek" {
+                "DELEGATE to sub-agents (recon/web/exploit) for parallel work. "
+            } else {
+                "Do NOT delegate to sub-agents — do the work inline (delegation multiplies context and \
+                 won't fit this window). "
+            },
             machine_block = if machine { machine_methodology(true) } else { String::new() }
         );
     }
 
     format!(
-        "You are an assistant to an authorized penetration tester. \
-         Use the run_command tool to run system tools. \
-         TRACE YOUR WORK: before you start an exploit / credential-guess / attack path, call \
-         log_attempt with status=\"trying\" and a one-line `action`; once you see the outcome, call \
-         it again with status succeeded/failed/abandoned and a one-line `result`. Consult the \
-         attempt log and NEVER repeat an approach already marked failed or abandoned — that \
-         is the #1 source of wasted tokens. \
-         record_finding the INSTANT you reach a milestone — ABOVE ALL, a captured flag: the moment \
-         you read user.txt / root.txt or see any `HTB{{...}}` / `flag{{...}}`, call record_finding with \
-         severity critical and the flag value in the summary (this is the goal — never just print a \
-         flag without recording it). Also record a working shell/RCE (with the command/URL), valid \
-         credentials (the pair), and each confirmed vulnerability. ONE finding per distinct issue — \
-         near-duplicates are auto-rejected, so log confirmed results freely rather than hoarding \
-         them; routine version banners alone aren't findings. \
-         If a detail was summarized away or compacted out of context, use the recall tool to fetch \
-         the full original output (by keyword) before assuming it's lost. \
-         BE TERSE: reason internally in as few words as possible — a sentence or two, never \
-         paragraphs. Do NOT narrate your plan, restate command output back to the operator, or \
-         write long commentary. Spend tokens on tool calls and findings, not prose. \
-         WORK INLINE — sub-agents are NOT free and NOT parallel here: each delegate_to_agent reloads \
-         the ENTIRE system prompt + tools and runs to completion before you continue, so delegating \
-         multiplies token cost for zero speed gain. Do recon, web, and exploit yourself in one loop. \
-         Only delegate when there is a genuinely separate target (e.g. a second host) you would \
-         otherwise ignore — NEVER to split phases on a single box. \
-         EFFICIENCY (critical — wasted commands cost time and tokens): \
-         (1) Do NOT re-run a scan or request whose output is already in the conversation — read \
-         the earlier result instead. One full nmap port scan per host is enough; never repeat it. \
-         (2) Pipes/redirects need a shell: use tool=\"bash\", argv=[\"-c\", \"<full line>\"]. \
+        "You are a senior penetration tester on an authorized assignment — scope-bound, \
+         evidence-driven, creative where it matters. You think in kill chains, not checklists. \
+         Verify every finding with hands-on exploitation before calling it real.\n\n\
+         {rules_of_engagement}\n\n\
+         {tool_usage}\n\n\
+         {attempt_tracking}\n\n\
+         {finding_reporting}\n\n\
+         {skills_guidance}\n\n\
+         {reasoning_style}\
+         {delegation_style}\
+         EFFICIENCY: \
+         (1) Do NOT re-run a scan whose output is already visible — read the earlier result. \
+         One full nmap port scan per host is enough. \
+         (2) Pipes/redirects need a shell: tool=\"bash\", argv=[\"-c\", \"<full line>\"]. \
          (3) The tool name is the bare executable (e.g. \"nmap\"), never \"run_command\". \
-         (4) To read a file, grep for the part you need (e.g. grep -n -A5 'keyword' file) instead of \
-         dumping the whole thing; if a tool result came back truncated, call recall to fetch the \
-         full text — do NOT re-run the command or page it with sed/head/tail line ranges (that is a \
-         top source of wasted tokens). \
-         Stay strictly within the engagement scope — never target hosts outside it. \
-         {os_hint} {install_hint}{skills_catalog}{solve_challenge}{machine_block}",
-        machine_block = if machine { machine_methodology(false) } else { String::new() }
+         (4) To inspect a file, grep for the part you need instead of dumping it whole; if output \
+         was truncated, call recall to fetch the full text — never re-page with sed ranges. \
+         (5) If a tool is missing, install it non-interactively (OPEN MODE) or tell the operator \
+         the exact command (CONTROLLED MODE) — never loop on 'command not found'.\n\n\
+         {operator_priority}\n\n\
+         {anti_patterns}\n\n\
+         {methodology}\
+         Stay strictly within scope — never touch hosts outside it.\n\n\
+         {os_hint}\n{install_hint}{skills_catalog}{solve_challenge}",
+        rules_of_engagement = "RULES OF ENGAGEMENT: Authorized testing only. The scope is your \
+            fence — do not probe out-of-scope assets. Prove impact with controlled PoCs (id, \
+            whoami, read one canary file). Never exfiltrate real data beyond what demonstrates \
+            the finding. No destructive actions unless explicitly authorized.",
+        tool_usage = "TOOLS: run_command executes system commands. \
+            Use use_skill FIRST for any matching challenge category (ctf-web, ctf-pwn, etc.) — \
+            load the router, pick the matching technique file, load it, and FOLLOW its steps. \
+            Skills are proven playbooks; improvise only after exhausting them. \
+            delegate_to_agent spawns specialists (recon/web/exploit) with isolated context. \
+            Use recall to fetch full output when truncated; use log_attempt to trace every approach.",
+        attempt_tracking = "ATTEMPT TRACKING: Before starting any exploit, credential guess, or \
+            attack path, call log_attempt(status=\"trying\", action=\"<one-liner>\"). After seeing \
+            the outcome, call it again with status=succeeded/failed/abandoned + a one-line result. \
+            Check the attempt log in your context and NEVER repeat a failed/abandoned approach — \
+            that is the #1 source of wasted tokens.",
+        finding_reporting = "FINDINGS: Record milestones INSTANTLY. A captured flag (user.txt, \
+            root.txt, HTB{{...}}, flag{{...}}) → record_finding severity=critical with the flag \
+            value. A working shell/RCE → record with the command/URL. Valid credentials → record \
+            the pair. One finding per distinct issue. Routine enumeration (open ports, version \
+            banners) is NOT a finding — but logging confirmed results freely is better than \
+            hoarding them. Near-duplicates are auto-rejected.",
+        skills_guidance = "SKILLS-FIRST: For ANY target matching a skill category, call use_skill \
+            FIRST. Load the router, pick the matching technique file, call use_skill AGAIN with \
+            file=\"<that file>\", then FOLLOW the steps. Do not just acknowledge the router list \
+            and move on. Skills are battle-tested playbooks — they are the fastest path to the flag. \
+            Only improvise when no skill matches.",
+        reasoning_style = if provider_id == "deepseek" {
+            "REASON OUT LOUD: write a brief sentence of reasoning before each tool call — \
+             e.g. \"Port 443 is open, trying HTTPS\" or \"Login failed with admin:admin, let me \
+             try the UCP panel instead.\" This is HOW you think — skip it and you will miss \
+             obvious next steps and loop on dead ends. One sentence per action is plenty.\n\n"
+        } else {
+            "POSTURE: Do, then narrate. A sentence or two of reasoning is useful — but never \
+             paragraphs of narration. Spend tokens on tool calls and findings, not prose.\n\n"
+        },
+        delegation_style = if provider_id == "deepseek" {
+            "SUB-AGENTS: Use delegate_to_agent to parallelize work immediately on a machine \
+             engagement. Launch recon (port/service scan), web (HTTP surface), and exploit (CVE \
+             research) agents concurrently. Each sub-agent returns a distilled summary — their \
+             tool calls do NOT consume your context. Sub-agents are your biggest force-multiplier.\n\n"
+        } else {
+            "DELEGATION: delegate_to_agent spawns specialists with isolated context. Use for \
+             genuinely separate workstreams (different hosts, parallel recon + exploit research). \
+             Avoid splitting trivial sub-tasks — inline a simple curl instead. Sub-agents return \
+             distilled summaries that preserve your context budget.\n\n"
+        },
+        anti_patterns = "ANTI-PATTERNS — these WILL waste tokens and fail the engagement:\n\
+            • Scan-and-report: pasting tool output as findings without verifying by hand.\n\
+            • Stopping at 'injectable' instead of proving realistic impact (RCE, data exfil).\n\
+            • Re-running the same command with different parameters 5+ times when all return \
+            the same error — if 3 tries fail identically, CHANGE your approach.\n\
+            • Skipping attack-chain reasoning — three mediums that compose into account takeover \
+            is a CRITICAL. Think about how findings chain together.\n\
+            • Ignoring files the operator placed in the workspace — they are there for a reason.\n\
+            • Calling use_skill once and moving on — you MUST load a specific technique file.\n\
+            • Using tool=bash without -c for shell syntax — pipes/redirects need \
+            tool=\"bash\" argv=[\"-c\", \"<full command>\"], NOT raw argv tokens.\n\
+            • Fixating on reverse shells when a simpler path exists — if a root-privileged command \
+            execution path exists (incron, SUID, writable root-sourced file), prefer: \
+            echo 'cat /root/root.txt > /var/www/html/flag.txt' >> <the writable file> \
+            instead of spending 20+ rounds debugging reverse shell stability.",
+        operator_priority = "OPERATOR PRIORITY: The operator knows this engagement better than \
+            you. When they give a direct instruction (e.g. 'just read the flag from X', 'use this \
+            specific exploit', 'don't bother with Y'), execute it IMMEDIATELY — do not continue \
+            exploring your own approach. Operator messages override methodology. Resume autonomous \
+            exploration only AFTER the instructed task is complete.",
+        methodology = if machine {
+            "METHODOLOGY — kill chain (do NOT stop at foothold):\n\
+             1) RECON: one full port scan; identify each service + exact version.\n\
+             2) FOOTHOLD: known CVE for the exact version, default creds, or web exploit (use \
+             use_skill(\"ctf-web\") first). Get code-exec / shell.\n\
+             3) LOOT: grab user flag, then harvest creds — configs, history, SSH keys — TEST \
+             every password for reuse (su/ssh).\n\
+             4) PRIVESC TO ROOT: sudo -n -l (GTFOBins) → SUID (find / -perm -4000) → \
+             capabilities (getcap -r /) → cron + writable scripts → readable secrets → \
+             files ROOT reads that YOU can write (the highest-value box-specific path) → \
+             kernel/service exploit. If root-privileged command execution exists (a file you \
+             can write that is sourced/executed by root), the SIMPLEST path is: \
+             echo 'cat /root/root.txt > /var/www/html/flag.txt' >> <that file> then trigger it. \
+             You do NOT always need a reverse shell — reading the flag is the goal. \
+             Confirm uid=0 only if you NEED a shell for further steps.\n\
+             Build on the attempt log and confirmed findings below — don't re-enumerate.\n\n"
+        } else {
+            ""
+        },
     )
 }
 
@@ -1984,30 +2109,30 @@ mod tests {
 
     #[test]
     fn open_mode_lets_the_agent_install_tools() {
-        let p = stable_system_prompt(false, true, "", "", false);
+        let p = stable_system_prompt(false, true, "", "", false, "claude");
         assert!(p.contains("OPEN MODE"));
         assert!(p.to_lowercase().contains("install it yourself"));
     }
 
     #[test]
     fn controlled_mode_forbids_install_and_advises_operator() {
-        let p = stable_system_prompt(false, false, "", "", false);
+        let p = stable_system_prompt(false, false, "", "", false, "claude");
         assert!(p.contains("CONTROLLED MODE"));
         assert!(p.contains("must NOT install"));
     }
 
     #[test]
     fn prompt_discourages_delegation_for_single_target() {
-        let p = stable_system_prompt(false, false, "", "", false);
+        let p = stable_system_prompt(false, false, "", "", false, "claude");
         assert!(p.contains("delegate_to_agent"));
-        assert!(p.contains("WORK INLINE"));
-        assert!(!p.contains("DEFAULT for separable work"));
+        assert!(p.contains("DELEGATION"));
+        assert!(p.contains("Avoid splitting trivial sub-tasks"));
     }
 
     #[test]
     fn slim_prompt_is_smaller_and_forbids_delegation() {
-        let full = stable_system_prompt(false, false, "", "", false);
-        let slim = stable_system_prompt(true, false, "", "", false);
+        let full = stable_system_prompt(false, false, "", "", false, "claude");
+        let slim = stable_system_prompt(true, false, "", "", false, "claude");
         assert!(slim.len() < full.len(), "slim prompt should be shorter");
         assert!(slim.contains("Do NOT delegate"), "slim must forbid delegation");
         assert!(!slim.contains("DEFAULT for separable work"));
@@ -2018,14 +2143,14 @@ mod tests {
         let ctf_playbook = "## MANDATORY CTF PLAYBOOK";
         // Machine engagement: methodology + privesc checklist, and the CTF playbook is gated off
         // (the caller passes solve_challenge="" for machines).
-        let machine = stable_system_prompt(false, false, "", "", true);
-        assert!(machine.contains("MACHINE ENGAGEMENT"), "machine methodology present");
+        let machine = stable_system_prompt(false, false, "", "", true, "claude");
+        assert!(machine.contains("METHODOLOGY"), "methodology section present");
         assert!(machine.contains("PRIVESC TO ROOT"), "privesc checklist present");
         assert!(machine.contains("perm -4000"), "SUID step present");
         assert!(!machine.contains(ctf_playbook), "CTF playbook must be gated off on a machine");
         // Challenge engagement: no machine methodology block.
-        let challenge = stable_system_prompt(false, false, "", ctf_playbook, false);
-        assert!(!challenge.contains("MACHINE ENGAGEMENT"), "no machine block for a challenge");
+        let challenge = stable_system_prompt(false, false, "", ctf_playbook, false, "claude");
+        assert!(!challenge.contains("PRIVESC TO ROOT"), "no privesc methodology for a challenge");
         assert!(challenge.contains(ctf_playbook), "CTF playbook present for a challenge");
     }
 
@@ -2281,6 +2406,8 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         orch.handle_prompt(&store, tx, "hi there").await.unwrap();
+        // Force-persist so the fresh orchestrator can hydrate from the store.
+        orch.save_current_conversation(&store);
         let saved_len = orch.history_len("default");
         assert!(saved_len > 0, "the turn should have populated history");
 

@@ -27,6 +27,25 @@ use crate::{LlmError, LlmProvider, Result};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 
+/// DeepSeek V3 (`deepseek-chat`) has NO internal chain-of-thought — it reasons in visible text.
+/// The system prompt tells the model "BE TERSE: reason internally" which Claude handles but kills
+/// DeepSeek: it stops thinking altogether and just spams tool calls. This prefix counteracts that.
+const DEEPSEEK_IDENTITY: &str =
+    "[You are DeepSeek, by DeepSeek. You are serving as a penetration testing assistant.\n\
+     Your operator configured you through this application. Do not claim to be Claude or any \n\
+     other model — you are DeepSeek.\n\
+     IMPORTANT — Unlike Claude you do NOT have internal reasoning. You MUST write a brief \n\
+     sentence of reasoning before every tool call so you can think through what to do next. \n\
+     A line like \"Port 443 is open, let me try HTTPS\" before the curl command is essential — \n\
+     skip the reasoning and you WILL make mistakes and loop on dead ends. Do NOT just fire \n\
+     commands silently. One sentence of thought per tool call is all you need.]\n\n";
+/// DeepSeek V3 default max output is 8192; the orchestrator's output cap should not be tighter
+/// than the model supports. Tool-call arguments + reasoning both consume output tokens.
+const DEEPSEEK_MAX_TOKENS: u32 = 8192;
+/// Modest temperature keeps tool-use deterministic. DeepSeek supports temperature on both
+/// `deepseek-chat` (V3) and `deepseek-reasoner` (R1).
+const DEEPSEEK_TEMPERATURE: f64 = 0.1;
+
 pub struct DeepSeekProvider {
     api_key: String,
     model: String,
@@ -70,7 +89,8 @@ impl LlmProvider for DeepSeekProvider {
             "messages": translate_messages(messages),
             "stream": true,
             "stream_options": { "include_usage": true },
-            "max_tokens": 4096,
+            "max_tokens": DEEPSEEK_MAX_TOKENS,
+            "temperature": DEEPSEEK_TEMPERATURE,
         });
         if !tools.is_empty() {
             body["tools"] = json!(tools.iter().map(translate_tool).collect::<Vec<_>>());
@@ -94,6 +114,10 @@ impl LlmProvider for DeepSeekProvider {
         let (tx, rx) = mpsc::unbounded::<AgentEvent>();
         tokio::spawn(async move { pump_sse(resp.bytes_stream(), tx).await });
         Ok(Box::pin(rx))
+    }
+
+    fn provider_id(&self) -> &str {
+        "deepseek"
     }
 }
 
@@ -131,8 +155,11 @@ where
                     buf = buf[pos + 2..].to_string();
                     if on_sse_message(&msg, &tx, &mut tools, &mut input_tokens, &mut output_tokens) {
                         ended = true;
+                        // [DONE] received — break immediately, don't wait for stream close.
+                        break;
                     }
                 }
+                if ended { break; }
             }
             Err(e) => {
                 let _ = tx.unbounded_send(AgentEvent::Error { message: e.to_string() });
@@ -188,7 +215,9 @@ fn on_sse_message(
     // `reasoning_content` (deepseek-reasoner CoT) is deliberately ignored — see module docs.
     if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
         if !text.is_empty() {
-            let _ = tx.unbounded_send(AgentEvent::TextDelta { text: text.to_string() });
+            // DeepSeek may emit text_deltas with trailing newlines that turn each word into a
+            // separate paragraph in the frontend's ReactMarkdown render. Trim trailing whitespace.
+            let _ = tx.unbounded_send(AgentEvent::TextDelta { text: text.trim_end().to_string() });
         }
     }
 
@@ -247,7 +276,12 @@ fn translate_messages(messages: &[Message]) -> Vec<Value> {
         match m.role {
             // The two-block system prompt (stable + volatile) is merged into one system message;
             // DeepSeek has no separate system field and no cache breakpoint to preserve.
-            Role::System => out.push(json!({ "role": "system", "content": join_text(&m.content) })),
+            // The identity prefix stops DeepSeek from hallucinating a Claude identity when the
+            // prompt style (Claude-tuned: terse, tool-heavy, efficiency rules) triggers it.
+            Role::System => out.push(json!({
+                "role": "system",
+                "content": format!("{DEEPSEEK_IDENTITY}{}", join_text(&m.content))
+            })),
             Role::User => out.push(json!({ "role": "user", "content": join_text(&m.content) })),
             Role::Assistant => {
                 let mut text = String::new();
@@ -386,7 +420,14 @@ mod tests {
         };
         let out = translate_messages(&[msg]);
         assert_eq!(out[0]["role"], "system");
-        assert_eq!(out[0]["content"], "stable instructions\n\nvolatile scope");
+        assert_eq!(
+            out[0]["content"],
+            format!("{DEEPSEEK_IDENTITY}stable instructions\n\nvolatile scope")
+        );
+        // Verify the identity prefix is present and comes first.
+        let content = out[0]["content"].as_str().unwrap();
+        assert!(content.starts_with("[You are DeepSeek"), "identity prefix first");
+        assert!(content.contains("stable instructions\n\nvolatile scope"), "original content preserved");
     }
 
     #[test]

@@ -38,4 +38,12 @@ pub trait LlmProvider: Send + Sync {
         messages: &[Message],
         tools: &[ToolSpec],
     ) -> Result<BoxStream<'static, AgentEvent>>;
+
+    /// Identifies the provider so the orchestrator can adjust its prompt style. Returns
+    /// `"claude"`, `"deepseek"`, `"ollama"`, or `"generic"`. Claude-tuned prompts (terse,
+    /// inline-only) cripple DeepSeek (no internal reasoning, follows rules literally); when
+    /// this returns `"deepseek"` the orchestrator switches to DeepSeek-optimized instructions.
+    fn provider_id(&self) -> &str {
+        "generic"
+    }
 }
