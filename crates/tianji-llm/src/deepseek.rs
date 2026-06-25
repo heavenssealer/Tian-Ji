@@ -215,9 +215,15 @@ fn on_sse_message(
     // `reasoning_content` (deepseek-reasoner CoT) is deliberately ignored — see module docs.
     if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
         if !text.is_empty() {
-            // DeepSeek may emit text_deltas with trailing newlines that turn each word into a
-            // separate paragraph in the frontend's ReactMarkdown render. Trim trailing whitespace.
-            let _ = tx.unbounded_send(AgentEvent::TextDelta { text: text.trim_end().to_string() });
+            // DeepSeek wraps text_delta content in \n\n. Strip ONLY leading/trailing
+            // newlines while preserving intentional paragraph breaks.
+            let cleaned = text.trim_start_matches('\n').trim_end_matches('\n');
+            if cleaned.is_empty() {
+                // Original was only newlines — emit one to preserve paragraph break
+                let _ = tx.unbounded_send(AgentEvent::TextDelta { text: "\n".to_string() });
+            } else {
+                let _ = tx.unbounded_send(AgentEvent::TextDelta { text: cleaned.to_string() });
+            }
         }
     }
 

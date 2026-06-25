@@ -277,10 +277,19 @@ fn on_sse_message(
                 Some("text_delta") => {
                     let t = str_field(&v["delta"]["text"]);
                     if !t.is_empty() {
-                        // DeepSeek's Anthropic endpoint may emit text_deltas with trailing
-                        // newlines that turn each word into a separate ReactMarkdown paragraph.
-                        // Trim trailing whitespace so concatenation produces flowing prose.
-                        let _ = tx.unbounded_send(AgentEvent::TextDelta { text: t.trim_end().to_string() });
+                        // DeepSeek's Anthropic endpoint wraps text_delta values in \n\n
+                        // (e.g. {"text": "\n\nbash\n\n"}). Strip ONLY protocol-level wrapping
+                        // while preserving intentional formatting within the text.
+                        let cleaned = t.trim_start_matches('\n').trim_end_matches('\n');
+                        // If the token was PURELY structural whitespace (a standalone \n\n
+                        // paragraph break), preserve it as a single \n so paragraphs don't
+                        // fuse together. Empty after trimming means it was all newlines.
+                        if cleaned.is_empty() {
+                            // Original was only newlines — emit one to preserve the break
+                            let _ = tx.unbounded_send(AgentEvent::TextDelta { text: "\n".to_string() });
+                        } else {
+                            let _ = tx.unbounded_send(AgentEvent::TextDelta { text: cleaned.to_string() });
+                        }
                     }
                 }
                 Some("input_json_delta") => {
