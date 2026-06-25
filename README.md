@@ -1,285 +1,200 @@
+<div align="center">
+
+![Tiān Jī](app-icon.png)
+
 # Tiān Jī (天机)
 
-An LLM-orchestrated pentesting framework. Multiple concurrent terminals, cloud/local agents
-that drive system tooling under human-controlled guardrails, per-engagement workspaces,
-persistent memory, and a phase-aware UI.
+**AI-piloted pentesting operator.**  
+Scope-bound, policy-gated, evidence-driven.
 
-- Architecture & rationale: [`DESIGN.md`](./DESIGN.md)
-- Crate/module map: [`SKELETON.md`](./SKELETON.md)
-- Codebase guide (for contributors / Claude Code): [`CLAUDE.md`](./CLAUDE.md)
+[![Rust](https://img.shields.io/badge/Rust-1.77%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Tauri 2](https://img.shields.io/badge/Tauri-2.0-FFC131?logo=tauri&logoColor=black)](https://v2.tauri.app)
+[![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> Status: **v0.1.0 — functional, well past the original vertical slice.** The full loop is wired
-> and extended: workspaces → Claude **or local (Ollama)** agent → tiered-approval tool execution
-> → append-only event log → live xterm + streaming chat. Beyond the MVP it now ships
-> **subscription (OAuth) auth** alongside API keys, an **autonomous goal loop**, **sub-agent
-> delegation**, an **attempt/trace log**, **on-demand recall**, **Agent Skills** (CTF playbooks),
-> and an aggressive **token-economy** layer (prompt caching, rolling compaction, output
-> summarization, read-only command dedup, and optional [RTK](#token-economy) compression).
-> `cargo test --workspace` and `cargo check --workspace` pass; the frontend typechecks and builds.
-> To use a cloud agent you need an Anthropic API key **or** a Claude Pro/Max subscription (see
-> [Authentication](#authentication)); local models need no key.
+[**Architecture**](#architecture) · [**Quick Start**](#quick-start) · [**Providers**](#providers) · [**Safety**](#safety) · [**Token Economy**](#token-economy)
+
+</div>
 
 ---
 
-## Prerequisites
+## Overview
 
-| Requirement | Version | Notes |
+Tiān Jī is a **Tauri 2 desktop app** that puts an LLM agent behind the terminal for authorized penetration testing. You talk to the agent; it proposes shell commands, routes them through a pure Rust policy engine, and only touches a real terminal after tiered human approval — or, in autonomous mode, after scope verification.
+
+It is not a chatbot. It is not a scanner wrapper. It is a **terminal-native operator** — the agent runs `nmap`, `curl`, `gobuster`, `sqlmap`, `hydra`, and every other tool on your machine, while the policy engine ensures it never leaves scope.
+
+Three operating modes:
+
+| Mode | Behaviour |
+|---|---|
+| **Default** | Every mutating command waits for explicit approval |
+| **⚡ Auto** | In-scope commands auto-execute; out-of-scope / denies still block |
+| **☢ Free** | All policy checks bypassed — lab / trusted environments only |
+
+---
+
+## Features
+
+### Multi-provider agent
+
+| Provider | Models | Auth |
 |---|---|---|
-| **Node.js** | ≥ 20 | `node --version` to check |
-| **Rust** | stable (≥ 1.77) | install via [rustup.rs](https://rustup.rs) |
-| **System libs** | see below | WebKitGTK, D-Bus, etc. (Linux only) |
+| **DeepSeek** | `deepseek-v4-pro`, `deepseek-v4-flash`, `deepseek-chat`, `deepseek-reasoner` | API key |
+| **Anthropic** | `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5` | API key or OAuth (Claude Pro/Max) |
+| **Ollama** (local) | Any pulled model | None |
+
+DeepSeek models speak the **Anthropic Messages API** natively via `api.deepseek.com/anthropic` — same wire format as Claude. No translation layer. Provider-aware prompt generation adapts reasoning and delegation style per model.
+
+### Policy engine — the safety spine
+
+Every command passes through `tianji-policy`:
+
+```
+LLM proposes command → resolve_targets() → classify() → decide() → Auto-run / Park / Deny
+```
+
+The LLM **never** classifies its own risk. Unknown commands fail closed to human approval.
+
+### Agent tools
+
+| Tool | Purpose |
+|---|---|
+| `run_command` | Execute system tools — `nmap`, `curl`, `gobuster`, `hydra`, custom scripts |
+| `use_skill` | Load proven CTF playbooks (ctf-web, ctf-pwn, etc.) — two-level disclosure |
+| `delegate_to_agent` | Spawn recon / web / exploit sub-agents with isolated context |
+| `record_finding` | Capture flags, shells, creds, confirmed vulns |
+| `log_attempt` | Trace every approach — never repeat a dead end |
+| `recall` | Fetch full output truncated from context |
+
+### Durable engagement state
+
+Every event — prompts, responses, tool calls, output, findings — is written to an append-only per-workspace SQLite log. Restart the app, switch workspaces, come back days later: the engagement is there.
+
+### Token economy
+
+| Layer | Mechanism |
+|---|---|
+| Prompt caching | Stable system prefix cached at ~10% input cost from turn 2 |
+| Rolling compaction | Old turns summarised on a cheaper model |
+| Tool output cap | Large output truncated; raw retrievable via `recall` |
+| Command dedup | Identical read-only commands reuse cached output |
+| Cost meter | Cumulative spend per workspace; hard budget cap |
+| Goal safeguards | Autonomous runs self-stop at 15 iterations or ~600k tokens |
+
+Rough cost: an autonomous HTB box is **~250k–600k metered tokens ≈ $2–6 on Claude Opus**, less on DeepSeek.
 
 ---
 
-## Linux setup
+## Architecture
 
-Tauri 2.0 requires WebKitGTK 4.1 and a handful of other system libraries. The exact package
-names differ by distro.
-
-### Ubuntu 22.04+ / Debian 12+
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  build-essential \
-  curl \
-  wget \
-  file \
-  pkg-config \
-  libssl-dev \
-  libwebkit2gtk-4.1-dev \
-  libayatana-appindicator3-dev \
-  librsvg2-dev \
-  libdbus-1-dev \
-  libglib2.0-dev \
-  libgtk-3-dev
+```
+crates/
+  tianji-types/     Shared domain types (leaf crate)
+  tianji-policy/    Policy engine — pure, no I/O (the safety spine)
+  tianji-store/     Append-only SQLite event log + read-models
+  tianji-pty/       PTY manager (portable-pty)
+  tianji-llm/       LlmProvider trait + Claude + DeepSeek + Ollama adapters
+  tianji-agent/     Orchestrator, MCP host, context assembler, skills, runner
+src-tauri/          Desktop binary — IPC glue only
+src/                Web frontend (Vite + React + Tailwind)
 ```
 
-> **Ubuntu 20.04**: `libwebkit2gtk-4.1-dev` is not available. Upgrade to 22.04 or use the
-> AppImage release instead of building from source.
+Dependencies point inward toward `tianji-types`. Nothing depends on `src-tauri`.
 
-### Fedora / RHEL 9+
+### The turn loop
 
-```bash
-sudo dnf install -y \
-  gcc \
-  openssl-devel \
-  webkit2gtk4.1-devel \
-  libappindicator-gtk3-devel \
-  librsvg2-devel \
-  dbus-devel \
-  gtk3-devel
 ```
-
-### Arch Linux
-
-```bash
-sudo pacman -Syu --needed \
-  base-devel \
-  openssl \
-  webkit2gtk-4.1 \
-  libayatana-appindicator \
-  librsvg \
-  dbus \
-  gtk3
-```
-
-### Keyring on Linux
-
-The app stores the Anthropic API key via the system **Secret Service** (GNOME Keyring or KDE
-Wallet). Make sure one of these is running in your session:
-
-```bash
-# GNOME/Ubuntu — usually pre-installed
-gnome-keyring-daemon --start
-
-# KDE
-# KWallet is started automatically with the KDE session
-
-# Headless / no DE — run a lightweight service:
-sudo apt-get install gnome-keyring
-dbus-run-session -- gnome-keyring-daemon --unlock
-```
-
-If you get a `No such interface` or `org.freedesktop.secrets` error when saving the API key,
-install and start `gnome-keyring`.
-
----
-
-## Windows setup
-
-WebView2 is pre-installed on Windows 10 (v1803+) and Windows 11. No extra system packages
-needed beyond Rust and Node.
-
----
-
-## macOS setup
-
-No extra system packages needed. Xcode Command Line Tools provide the compiler:
-
-```bash
-xcode-select --install
+Operator prompt
+    → Load scope / rules / phase / notes / attempts / findings
+    → Rebuild system prompt: stable (cached) + volatile (uncached)
+    → Maybe compact old history via sub-agent summarisation
+    → Up to 8 model rounds: assemble → trim → provider.run_turn() →
+      for each tool call: policy check → execute / park / deny → feed results back
+    → Persist to session history + workspace DB
 ```
 
 ---
 
-## Install Rust
+## Quick Start
+
+### Prerequisites
+
+| Requirement | Version |
+|---|---|
+| Node.js | ≥ 20 |
+| Rust | stable ≥ 1.77 |
+| System libs | WebKitGTK 4.1, D-Bus (Linux only) |
+
+### Linux dependencies
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-rustup default stable
+# Ubuntu 22.04+ / Debian 12+
+sudo apt-get install -y build-essential pkg-config libssl-dev \
+  libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+  libdbus-1-dev libglib2.0-dev libgtk-3-dev
 ```
 
----
-
-## Clone & build
+### Build & run
 
 ```bash
 git clone https://github.com/heavenssealer/Tian-Ji.git
 cd Tian-Ji
 npm install
+npm run tauri dev          # hot-reload
+npm run tauri build        # production → src-tauri/target/release/bundle/
 ```
 
-### Development (hot-reload)
+### Verify without a desktop
 
 ```bash
-npm run tauri dev
-```
-
-### Production build
-
-```bash
-npm run tauri build
-# Output: src-tauri/target/release/bundle/
-#   Linux  → .deb + .AppImage
-#   Windows → .msi + NSIS .exe
-#   macOS  → .dmg + .app
+npx tsc --noEmit && npm run build && cargo test --workspace && cargo check --workspace
 ```
 
 ---
 
-## Privileged tools (sudo)
+## Providers
 
-Some pentesting tools need root access (nmap SYN/raw-socket scans, tcpdump, masscan, arp-scan,
-editing `/etc/hosts`, etc.). The agent handles this two ways:
+### DeepSeek (recommended)
 
-- **Auto-elevation**: `nmap`, `masscan`, `rustscan`, `tcpdump`, `tshark`, `arp-scan`, and
-  `netdiscover` are automatically wrapped with `sudo -n` on Linux/macOS. `sudo -n` is
-  non-interactive — it fails immediately with a clear error if passwordless sudo is not
-  configured, rather than hanging.
-- **Explicit sudo**: for everything else (file writes, `ip`, `iptables`, etc.) the LLM uses
-  `sudo` as the tool name directly.
+Tiān Jī uses DeepSeek's **Anthropic Messages API** endpoint — the same wire format Claude uses. No OpenAI↔Anthropic translation. The Claude-tuned prompt, tools, and SSE streaming all work natively.
 
-**One-time sudoers setup** — grant NOPASSWD for the tools you use:
+1. Get an API key at [platform.deepseek.com](https://platform.deepseek.com)
+2. Paste it in Settings → DeepSeek API key
+3. Select a `deepseek-*` model
 
-```bash
-sudo visudo -f /etc/sudoers.d/tianji
-```
+### Anthropic
 
-Paste (replace `youruser` with your username):
+1. API key at [console.anthropic.com](https://console.anthropic.com), or
+2. Connect your Claude Pro/Max subscription via OAuth (Settings)
 
-```
-youruser ALL=(ALL) NOPASSWD: /usr/bin/nmap, /usr/bin/masscan, /usr/bin/rustscan, \
-    /usr/bin/tcpdump, /usr/bin/tshark, /usr/sbin/arp-scan, /usr/sbin/netdiscover, \
-    /usr/bin/tee, /bin/tee, /usr/bin/ip, /sbin/iptables
-```
+### Ollama (local, offline)
 
-> **Kali Linux**: the default user runs as root — no sudoers config needed.
-
-> **macOS**: use `sudo visudo` and add the same block. Tool paths may differ
-> (`/opt/homebrew/bin/nmap` etc.) — check with `which nmap`.
-
-## Authentication
-
-A cloud agent authenticates one of two ways, configured in the Settings panel (⚙ icon):
-
-- **Anthropic subscription (Claude Pro/Max)** — log in via OAuth; turns bill your subscription,
-  exactly like the Claude Code CLI. Takes precedence over an API key when both are present.
-- **Anthropic API key** — billed to your org's API credits. Get one at
-  [console.anthropic.com](https://console.anthropic.com).
-- **DeepSeek API key** — for the `deepseek-*` models (OpenAI-compatible). Paste a key from
-  [platform.deepseek.com](https://platform.deepseek.com); billed to your DeepSeek account.
-
-Each credential is stored in the OS keychain (Windows Credential Manager / macOS Keychain /
-GNOME Keyring or KDE Wallet) and never written to disk in plaintext. Disconnect the subscription
-to fall back to the Anthropic API key; the DeepSeek key is only used when a `deepseek-*` model is
-selected.
-
-**Local models (no key required):** select an `ollama:<model>` entry in the model picker to run
-fully offline against a local [Ollama](https://ollama.com) instance (`ollama pull <model>` first).
-Sensitive engagements stay on-box. Configure the Ollama host and context window in Settings.
-
-### Model picker
-
-Pick the orchestrator model in Settings — `claude-opus-4-8` (default), `claude-sonnet-4-6`,
-`claude-haiku-4-5`, a DeepSeek model (`deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-pro`,
-`deepseek-v4-flash`), or any pulled `ollama:` model. Sub-agents drop to a cheaper sibling for grunt
-work: Opus→Sonnet and DeepSeek's reasoner→chat automatically (a major cost lever).
-
-## Token economy
-
-An agent that drives attacker tooling over many rounds burns tokens fast. Several layers keep cost
-bounded (see [`CLAUDE.md`](./CLAUDE.md) for the mechanics):
-
-- **Prompt caching** — the stable system prompt + tool schemas are sent as a cached prefix, so from
-  turn two they bill at ~10% of input price. The volatile context (scope, notes, attempt log) sits
-  after the cache breakpoint.
-- **Rolling compaction** — once a session's history passes 75% of the context budget, the oldest
-  turns are summarized into a dense brief on the cheap (Sonnet/local) model instead of re-sent.
-- **Output summarization + dedup** — large tool output is summarized before it enters context (the
-  raw stays addressable via the `recall` tool); identical read-only commands reuse their prior
-  result instead of re-running.
-- **RTK (Rust Token Killer)** — optional: when the `rtk` binary is installed, output of supported
-  read-only tools (`ls`, `grep`, `git`, `cargo`, …) is compressed 60–90% before it reaches the
-  model. On by default, a silent no-op if `rtk` isn't found.
-- **Cost meter + budget cap** — cumulative token spend is shown per workspace; set a hard cap to
-  stop a runaway run. The autonomous goal loop additionally self-stops at 15 iterations or
-  ~600k tokens.
-
-> Rough order of magnitude: an autonomous **HTB box (user + root) costs ~250k–600k metered tokens
-> ≈ $2–6** on `claude-opus-4-8`, depending on how cleanly it solves. The goal loop's ~600k-token
-> ceiling is the hard stop.
+1. `ollama pull <model>` then select `ollama:<model>` — no key required.
 
 ---
 
-## Verify the build (no desktop required)
+## Safety
 
-```bash
-npx tsc --noEmit              # frontend typecheck
-npm run build                 # frontend bundle
-cargo test --workspace        # Rust unit tests
-cargo check --workspace       # whole workspace typecheck
-```
+- **Scope enforcement**: real arguments parsed for IPs, hostnames, URLs, CIDRs
+- **Classification**: ReadOnly / Mutating / DangerousFlags — fails closed
+- **Tiered approval**: ReadOnly auto-runs; Mutating needs approval
+- **Secrets**: API keys, sudo password, OAuth tokens live in OS keychain only
 
 ---
 
-## Project layout
+## Contributing
 
-```
-crates/
-  tianji-types     shared domain types (leaf)
-  tianji-policy    policy engine — PURE, no I/O (the safety spine)
-  tianji-store     event log + read-models (rusqlite, bundled)
-  tianji-pty       terminal/PTY manager (portable-pty)
-  tianji-llm       LlmProvider trait + Claude adapter
-  tianji-agent     orchestrator · MCP host · context assembler · approval gate
-src-tauri/         desktop binary — IPC glue only
-src/               web frontend (Vite + React + Tailwind)
-```
+The policy crate is pure and exhaustively tested. Run `cargo test -p tianji-policy` after any scope/classification change. Orchestrator tests use a scripted provider and stub runner.
+
+See [`CLAUDE.md`](./CLAUDE.md) for the codebase guide and [`DESIGN.md`](./DESIGN.md) for architectural rationale.
 
 ---
 
-## Safety posture
+## License
 
-Every agent-proposed command is routed through `tianji-policy` before it can touch a terminal:
-scope-check (real argv parsed for targets) → classify → tiered approval. Unknown commands fail
-closed to human approval; the LLM never classifies its own risk. See `DESIGN.md` §4.
+MIT — see [LICENSE](LICENSE).
 
-Three operating modes (toggle in the agent chat toolbar):
-
-| Mode | What it does |
-|---|---|
-| Default | Every non-read-only command requires explicit approval |
-| **⚡ auto** | In-scope commands auto-approve; out-of-scope and explicit denials still block |
-| **☢ free** | All policy checks bypassed — LLM runs whatever it judges useful. Use only in lab/trusted environments. |
+<div align="center">
+<sub>Built for authorized security work. Use only on systems you own, labs, CTFs, or targets where you have permission to test.</sub>
+</div>
